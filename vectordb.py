@@ -134,7 +134,7 @@ if __name__ == "__main__":
   and the car cannot move.
   Reverse: This position is used to back up.
   Neutral: This position is used when you are stopped at a light or in traffic.
-  The car is not in gear and will not move unless you press the gas pedal.
+  The car is not in gear and will not move until and unless you press the gas pedal.
   Drive: This position is used to drive forward.
   Low: This position is used for driving in snow or other slippery conditions.
 """
