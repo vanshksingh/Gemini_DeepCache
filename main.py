@@ -144,7 +144,7 @@ if __name__ == "__main__":
         local_path="SherlockJr._10min.mp4"
     )
 
-    cache, model = upload_video_and_cache(video_file_path, cache_name="silent-film-cache")
+    cache,model = upload_video_and_cache(video_file_path, cache_name="silent-film-cache")
 
     analyze_video(
         cache=cache,
