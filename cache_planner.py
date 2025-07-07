@@ -1,150 +1,202 @@
+import os
 import json
 import time
-import math
-from collections import defaultdict, Counter
+import logging
+import pickle
+from math import ceil
 from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Set
+
+from dotenv import load_dotenv
+from google import genai
 
 # === CONFIG ===
-CHUNKS_PATH        = Path("chunks.json")
-QUERIES_PATH       = Path("queries.json")
-MAX_BATCH_SIZE     = 5
-CACHE_DISCOUNT     = 0.25    # pay 25% for explicit‐cached tokens
-IMPLICIT_THRESHOLD = 100    # min tokens for implicit dynamic caching
-CACHE_TTL          = 3600    # seconds (simulated TTL)
+
+@dataclass
+class Config:
+    chunks_path: Path = Path("chunks.json")
+    queries_path: Path = Path("queries.json")
+    registry_path: Path = Path("implicit_registry.pkl")
+    max_batch_size: int = 5
+    cache_discount: float = 0.25       # pay 25% for explicit‐cached tokens
+    implicit_threshold: int = 1024     # min tokens for implicit dynamic caching
+    cache_ttl: int = 3600              # seconds (simulated TTL)
+    log_level: int = logging.INFO
+
+config = Config()
+
+# === SETUP ===
+
+load_dotenv()
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+logging.basicConfig(level=config.log_level, format="%(asctime)s %(levelname)s:%(message)s")
 
 # === HELPERS ===
+
+_token_cache: Dict[str, int] = {}
+
 def estimate_tokens(text: str) -> int:
-    return round(len(text.strip().split()) / 0.75)
+    if text not in _token_cache:
+        _token_cache[text] = ceil(len(text.strip().split()) / 0.75)
+    return _token_cache[text]
 
-def jaccard(a, b):
-    a, b = set(a), set(b)
-    return len(a & b) / len(a | b) if a | b else 0
+def jaccard(a: Tuple[str, ...], b: Tuple[str, ...]) -> float:
+    sa, sb = set(a), set(b)
+    return len(sa & sb) / len(sa | sb) if sa | sb else 0.0
 
-# === LOAD INPUT ===
-chunk_data      = json.load(open(CHUNKS_PATH))
-query_to_chunks = json.load(open(QUERIES_PATH))
+# === CORE ===
 
-# === DYNAMIC CORE SELECTION ===
-# Count how many generate calls each chunk would appear in:
-# We assume one call per query group before batching.
-query_freq = Counter()
-for chunks in query_to_chunks.values():
-    query_freq.update(chunks)
+def compute_core_chunks(query_map: Dict[str, List[str]]) -> Set[str]:
+    from collections import Counter
+    freq = Counter(cid for chunks in query_map.values() for cid in chunks)
+    return {cid for cid, cnt in freq.items() if cnt > 1}
 
-# Estimate number of batches per query as ceil(1/MAX_BATCH_SIZE),
-# but we can approximate f_c ≈ query_freq[c] / MAX_BATCH_SIZE (rounded up)
-batch_freq = {c: math.ceil(f / MAX_BATCH_SIZE)
-              for c, f in query_freq.items()}
+def build_batches(query_map: Dict[str, List[str]], core: Set[str]) -> List[Dict]:
+    from collections import defaultdict
+    dynamic_groups: Dict[Tuple[str,...], List[str]] = defaultdict(list)
+    for q, chunks in query_map.items():
+        dyn = tuple(sorted(set(chunks) - core))
+        dynamic_groups[dyn].append(q)
+    batches = []
+    for dyn, qs in dynamic_groups.items():
+        for i in range(0, len(qs), config.max_batch_size):
+            batches.append({"dynamic_chunks": dyn, "queries": qs[i:i+config.max_batch_size]})
+    return batches
 
-# Compute per-chunk benefit of explicit caching:
-# benefit = (batch_freq[c] * chunk_tokens * (1 - discount)) - chunk_tokens
-chunk_tokens = {c: estimate_tokens(t) for c, t in chunk_data.items()}
-core_chunks = {
-    c for c, f in batch_freq.items()
-    if (f * chunk_tokens[c] * (1 - CACHE_DISCOUNT) - chunk_tokens[c]) > 0
-}
-core_tokens = sum(chunk_tokens[c] for c in core_chunks)
+def order_batches(batches: List[Dict]) -> List[Dict]:
+    if not batches:
+        return []
+    remaining = batches.copy()
+    ordered = [remaining.pop(0)]
+    while remaining:
+        last = ordered[-1]["dynamic_chunks"]
+        def score(b):
+            overlap = jaccard(last, b["dynamic_chunks"])
+            tok = sum(estimate_tokens(c) for c in b["dynamic_chunks"])
+            return overlap * tok
+        nxt = max(remaining, key=score)
+        remaining.remove(nxt)
+        ordered.append(nxt)
+    return ordered
 
-# === BUILD BATCHES OF DYNAMIC PREFIXES ===
-dynamic_map = defaultdict(list)
-for q, chunks in query_to_chunks.items():
-    dyn = tuple(sorted(set(chunks) - core_chunks))
-    dynamic_map[dyn].append(q)
+# === SIMULATOR ===
 
-batches = []
-for dyn, qs in dynamic_map.items():
-    for i in range(0, len(qs), MAX_BATCH_SIZE):
-        batches.append({
-            "dynamic_chunks": dyn,
-            "queries":        qs[i:i+MAX_BATCH_SIZE]
-        })
+@dataclass
+class Simulator:
+    chunk_data: Dict[str, str]
+    query_map: Dict[str, List[str]]
+    core_chunks: Set[str]
+    now: float = field(default_factory=time.time)
+    implicit_registry: Dict[Tuple[str,...], float] = field(default_factory=dict)
+    plan: List[Dict] = field(default_factory=list)
+    total_raw: int = 0
+    total_opt: float = 0.0
 
-# === ORDER BATCHES FOR IMPLICIT HITS ===
-remaining = batches.copy()
-ordered = [remaining.pop(0)]
-while remaining:
-    last = ordered[-1]["dynamic_chunks"]
-    nxt = max(remaining, key=lambda b: jaccard(last, b["dynamic_chunks"]))
-    remaining.remove(nxt)
-    ordered.append(nxt)
+    def load_registry(self):
+        if config.registry_path.exists():
+            with open(config.registry_path, "rb") as f:
+                self.implicit_registry = pickle.load(f)
 
-# === SIMULATION ===
-plan       = []
-total_raw  = 0
-total_opt  = 0
-now        = time.time()
-implicit_registry = {}
+    def save_registry(self):
+        with open(config.registry_path, "wb") as f:
+            pickle.dump(self.implicit_registry, f)
 
-def simulate_implicit(prefix: tuple) -> int:
-    key = prefix
-    tok = sum(chunk_tokens[c] for c in prefix)
-    last = implicit_registry.get(key)
-    if last and (now - last) < CACHE_TTL:
-        implicit_registry[key] = now
-        return tok
-    implicit_registry[key] = now
-    return 0
+    def simulate_implicit(self, prefix: Tuple[str,...], tok: int) -> int:
+        last = self.implicit_registry.get(prefix)
+        self.implicit_registry[prefix] = self.now
+        if last and (self.now - last) < config.cache_ttl:
+            return tok
+        return 0
 
-# 1) Create explicit cache for core once
-if core_chunks:
-    plan.append({
-        "action":     "create_explicit_cache",
-        "chunk_ids":  sorted(core_chunks),
-        "ctx_tokens": core_tokens,
-        "ttl":        CACHE_TTL
-    })
-    total_opt += core_tokens
+    def should_explicit(self, batch_count: int, core_tok: int) -> bool:
+        # break-even check: total save > cost of creating cache
+        # saving per batch = core_tok*(1 - discount)
+        return batch_count * (1 - config.cache_discount) > 1
 
-# 2) Process each dynamic batch
-for gid, batch in enumerate(ordered, start=1):
-    dyn     = batch["dynamic_chunks"]
-    dyn_tok = sum(chunk_tokens[c] for c in dyn)
-    q_tok   = sum(estimate_tokens(q) for q in batch["queries"])
+    def run(self):
+        # load persistent registry
+        self.load_registry()
 
-    # raw = core + dynamic + queries
-    raw = core_tokens + dyn_tok + q_tok
-    total_raw += raw
+        # precompute
+        batches = build_batches(self.query_map, self.core_chunks)
+        ordered = order_batches(batches)
+        core_tok = sum(estimate_tokens(self.chunk_data[c]) for c in self.core_chunks)
 
-    # implicit dynamic hits
-    imp_hits = simulate_implicit(dyn) if dyn_tok >= IMPLICIT_THRESHOLD else 0
+        # maybe create explicit cache
+        if self.core_chunks and self.should_explicit(len(ordered), core_tok):
+            self.plan.append({
+                "action": "create_explicit_cache",
+                "chunk_ids": sorted(self.core_chunks),
+                "ctx_tokens": core_tok,
+                "ttl": config.cache_ttl
+            })
+            self.total_opt += core_tok
+            use_explicit = True
+        else:
+            logging.info("Skipping explicit cache (not cost-effective).")
+            use_explicit = False
 
-    # explicit core hits & cost
-    exp_hits = core_tokens
-    exp_cost = core_tokens * CACHE_DISCOUNT if core_chunks else 0
+        # per-batch sim
+        for gid, batch in enumerate(ordered, start=1):
+            dyn = batch["dynamic_chunks"]
+            dyn_tok = sum(estimate_tokens(self.chunk_data[c]) for c in dyn)
+            qry_tok = sum(estimate_tokens(q) for q in batch["queries"])
+            raw = (core_tok if use_explicit else core_tok + dyn_tok) + qry_tok
+            self.total_raw += raw
 
-    # uncached dynamic tokens
-    uncached_dyn = max(0, dyn_tok - imp_hits)
-    sent = uncached_dyn + q_tok
+            imp_hits = self.simulate_implicit(dyn, dyn_tok) if dyn_tok >= config.implicit_threshold else 0
+            exp_cost = core_tok * config.cache_discount if use_explicit else 0
+            uncached_dyn = max(0, dyn_tok - imp_hits)
+            sent = uncached_dyn + qry_tok
+            opt = sent + exp_cost
+            self.total_opt += opt
 
-    # charge generate: sent tokens + explicit discount
-    total_opt += sent + exp_cost
+            pct = 100*(raw - opt)/raw if raw else 0
+            logging.info(
+                "Batch %d: raw=%d, opt=%.2f (%.1f%% saving)",
+                gid, raw, opt, pct
+            )
 
-    plan.append({
-        "action":                "generate_content",
-        "group_id":              gid,
-        "batch_queries":         batch["queries"],
-        "core_explicit":         bool(core_chunks),
-        "implicit_dynamic_hits": imp_hits,
-        "explicit_cost":         exp_cost,
-        "dynamic_tokens":        dyn_tok,
-        "uncached_dynamic":      uncached_dyn,
-        "query_tokens":          q_tok,
-        "sent_tokens":           sent
-    })
+            self.plan.append({
+                "action": "generate_content",
+                "group_id": gid,
+                "batch_queries": batch["queries"],
+                "explicit_used": use_explicit,
+                "explicit_cost": exp_cost,
+                "implicit_hits": imp_hits,
+                "dynamic_tokens": dyn_tok,
+                "uncached_dynamic": uncached_dyn,
+                "query_tokens": qry_tok,
+                "sent_tokens": sent,
+                "batch_saving_pct": round(pct,1)
+            })
 
-# 3) Delete explicit cache at end
-if core_chunks:
-    plan.append({
-        "action":    "delete_explicit_cache",
-        "chunk_ids": sorted(core_chunks)
-    })
+        # delete explicit if created
+        if use_explicit:
+            self.plan.append({
+                "action": "delete_explicit_cache",
+                "chunk_ids": sorted(self.core_chunks)
+            })
 
-# === OUTPUT ===
-print("✅ Simulation Plan:")
-for step in plan:
-    print(json.dumps(step, ensure_ascii=False))
-print("\n📊 Cost Summary:")
-print(f"  Raw tokens sent     : {total_raw}")
-print(f"  Optimized token cost: {total_opt}")
-print(f"  Savings             : {total_raw - total_opt} tokens "
-      f"({(100*(total_raw-total_opt)/total_raw):.2f}%)")
+        # persist registry
+        self.save_registry()
+
+    def report(self):
+        savings = self.total_raw - self.total_opt
+        pct = 100 * savings / self.total_raw if self.total_raw else 0
+        logging.info("📊 FINAL SUMMARY: raw=%d, opt=%.2f, saved=%d tokens (%.2f%%)",
+                     self.total_raw, self.total_opt, savings, pct)
+
+def main():
+    chunks = json.loads(config.chunks_path.read_text())
+    queries = json.loads(config.queries_path.read_text())
+    core = compute_core_chunks(queries)
+
+    sim = Simulator(chunk_data=chunks, query_map=queries, core_chunks=core)
+    sim.run()
+    sim.report()
+
+if __name__ == "__main__":
+    main()
