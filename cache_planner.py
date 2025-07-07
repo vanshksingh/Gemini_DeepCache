@@ -1,23 +1,31 @@
 import json
 from collections import Counter
 import math
+import hashlib
 
-EXPLICIT_TOKEN_BUDGET = 400  # 80% of 10K budget
+# CONFIG
+EXPLICIT_TOKEN_BUDGET = 800
 WORDS_PER_TOKEN = 1 / 0.75
-TOKEN_COST = 1.0  # Normalize unit cost per token
+TOKEN_COST = 1.0
+MAX_GROUP_SIZE = 5
 
-def estimate_tokens(text: str) -> int:
-    return math.ceil(len(text.split()) / WORDS_PER_TOKEN)
-
-def load_chunks(path="chunks.json"):
-    with open(path, "r") as f:
-        chunks = json.load(f)
-    return {cid: {"text": text, "tokens": estimate_tokens(text)} for cid, text in chunks.items()}
-
-def load_queries(path="queries.json"):
-    with open(path, "r") as f:
+# --- Data Loading ---
+def load_json_file(file_path):
+    with open(file_path, "r") as f:
         return json.load(f)
 
+def estimate_tokens(text):
+    return math.ceil(len(text.split()) / WORDS_PER_TOKEN)
+
+def load_chunks(chunks_raw):
+    return {
+        cid: {
+            "text": text,
+            "tokens": estimate_tokens(text)
+        } for cid, text in chunks_raw.items()
+    }
+
+# --- Core Logic ---
 def count_chunk_usage(queries):
     usage = Counter()
     for chunk_ids in queries.values():
@@ -27,109 +35,128 @@ def count_chunk_usage(queries):
 def select_explicit_chunks(chunks, usage, token_budget):
     scored = sorted(
         chunks.items(),
-        key=lambda item: (usage[item[0]] * item[1]["tokens"]),
+        key=lambda item: usage[item[0]] * item[1]["tokens"],
         reverse=True,
     )
     explicit = {}
-    total_tokens = 0
-    for chunk_id, data in scored:
-        if total_tokens + data["tokens"] > token_budget:
+    total = 0
+    for cid, data in scored:
+        if total + data["tokens"] > token_budget:
             continue
-        explicit[chunk_id] = data
-        total_tokens += data["tokens"]
+        explicit[cid] = data
+        total += data["tokens"]
     return explicit
 
 def assign_implicit_chunks(queries, explicit_chunks):
-    implicit_plan = {}
-    for query, chunk_list in queries.items():
-        implicit_chunks = [cid for cid in chunk_list if cid not in explicit_chunks]
-        implicit_plan[query] = implicit_chunks
-    return implicit_plan
+    return {
+        query: [cid for cid in chunk_list if cid not in explicit_chunks]
+        for query, chunk_list in queries.items()
+    }
 
-def sort_queries_by_overlap(queries, explicit_chunks):
-    def overlap_score(chunk_list):
-        return sum(1 for cid in chunk_list if cid in explicit_chunks)
-    return sorted(queries.items(), key=lambda item: -overlap_score(item[1]))
+def group_similar_queries(queries, max_group=MAX_GROUP_SIZE):
+    items = list(queries.items())
+    return [dict(items[i:i + max_group]) for i in range(0, len(items), max_group)]
 
 def compute_costs(query_chunks, chunks, explicit_chunks, seen_chunks):
-    full_token_cost = 0
-    saved_token_cost = 0
     total_tokens = 0
+    cost = 0
+    saved = 0
+    implicit_hit = True
+    first_miss = None
 
-    for cid in query_chunks:
+    for i, cid in enumerate(query_chunks):
         tokens = chunks[cid]["tokens"]
         total_tokens += tokens
 
         if cid in explicit_chunks:
             if cid in seen_chunks:
-                cost = tokens * TOKEN_COST * 0.25  # 75% saved
-                saved = tokens * TOKEN_COST * 0.75
+                cost += tokens * 0.25
+                saved += tokens * 0.75
             else:
-                cost = tokens * TOKEN_COST
-                saved = 0
+                cost += tokens
         else:
-            cost = tokens * TOKEN_COST
-            saved = 0
+            if implicit_hit and cid in seen_chunks:
+                cost += tokens * 0.25
+                saved += tokens * 0.75
+            else:
+                if implicit_hit:
+                    first_miss = i
+                implicit_hit = False
+                cost += tokens
 
-        full_token_cost += cost
-        saved_token_cost += saved
+        seen_chunks.add(cid)
 
-        seen_chunks.add(cid)  # Track chunk as seen
+    return total_tokens, cost, saved, implicit_hit, first_miss
 
-    return total_tokens, full_token_cost, saved_token_cost
-
+# --- Main ---
 def main():
-    print("[🚀] Loading data...")
-    chunks = load_chunks()
-    queries = load_queries()
-    usage = count_chunk_usage(queries)
+    chunks_raw = load_json_file("chunks.json")
+    queries_raw = load_json_file("queries.json")
+    chunks = load_chunks(chunks_raw)
 
-    print(f"[ℹ️] Loaded {len(chunks)} chunks and {len(queries)} queries")
-
-    print("[📦] Selecting explicit chunks...")
-    explicit_chunks = select_explicit_chunks(chunks, usage, EXPLICIT_TOKEN_BUDGET)
-    print(f"[✅] Selected {len(explicit_chunks)} chunks for explicit cache ({sum(c['tokens'] for c in explicit_chunks.values())} tokens)")
-
-    print("[📑] Assigning implicit chunks per query...")
-    implicit_plan = assign_implicit_chunks(queries, explicit_chunks)
-
-    print("[🧠] Optimizing query execution order to minimize implicit cache swaps...")
-    sorted_queries = sort_queries_by_overlap(queries, explicit_chunks)
-
-    print("\n=== 🚧 CACHE PLAN ===")
-    print("📌 Explicit Cache:")
-    for cid in explicit_chunks:
-        print(f"  - {cid}")
-
-    print("\n📋 Per-query Plan with Cost Simulation:")
     seen_chunks = set()
-    total_cost = 0
+    last_cache_hash = None
+    uploaded_cache_versions = set()
+
+    total_query_cost = 0
+    total_upload_cost = 0
     total_saved = 0
+    total_tokens = 0
 
-    for query, chunk_list in sorted_queries:
-        implicit_chunks = implicit_plan[query]
-        all_chunks = chunk_list
+    grouped_batches = group_similar_queries(queries_raw)
 
-        tokens, cost, saved = compute_costs(all_chunks, chunks, explicit_chunks, seen_chunks)
-        total_cost += cost
-        total_saved += saved
+    print("\n=== 🚀 CACHE PLAN EXECUTION ===")
+    for i, query_batch in enumerate(grouped_batches):
+        print(f"\n=== 🧩 Query Group {i+1} ===")
+        usage = count_chunk_usage(query_batch)
+        explicit_chunks = select_explicit_chunks(chunks, usage, EXPLICIT_TOKEN_BUDGET)
 
-        print(f"\n🔍 Query: {query}")
-        print("   Implicit Chunks:")
-        if implicit_chunks:
-            for cid in implicit_chunks:
-                print(f"     - {cid}")
-        else:
-            print("     - None")
-        print(f"   🔢 Tokens: {tokens}")
-        print(f"   💰 Cost: {cost:.2f}")
-        print(f"   💸 Saved via explicit: {saved:.2f}")
-        print(f"   📉 Savings %: {((saved / (cost + saved)) * 100):.1f}%")
+        current_hash = hashlib.md5("".join(sorted(explicit_chunks)).encode()).hexdigest()
+        cache_changed = current_hash != last_cache_hash
+        last_cache_hash = current_hash
 
-    print("\n=== 📊 TOTAL SUMMARY ===")
-    print(f"Total Cost Across Queries: {total_cost:.2f}")
-    print(f"Total Saved from Explicit Cache: {total_saved:.2f}")
-    print(f"Overall Savings: {(total_saved / (total_cost + total_saved)) * 100:.2f}%")
+        print(f"🔁 Explicit Cache Changed: {'Yes' if cache_changed else 'No'}")
+        print("📌 Explicit Chunks:")
+        for cid in explicit_chunks:
+            print(f"  - {cid}")
+            if cache_changed:
+                # Always charged when cache changes, even for repeated chunks
+                upload_cost = chunks[cid]["tokens"] * TOKEN_COST
+                total_upload_cost += upload_cost
+
+        implicit_plan = assign_implicit_chunks(query_batch, explicit_chunks)
+
+        for query, chunk_list in query_batch.items():
+            implicit_chunks = implicit_plan[query]
+            tokens, cost, saved, implicit_hit, miss_pos = compute_costs(
+                chunk_list, chunks, explicit_chunks, seen_chunks
+            )
+
+            total_query_cost += cost
+            total_saved += saved
+            total_tokens += tokens
+
+            print(f"\n🔍 Query: {query}")
+            print(f"   Implicit Chunks: {implicit_chunks if implicit_chunks else 'None'}")
+            print(f"   🔢 Tokens: {tokens}")
+            print(f"   💰 Query Cost: {cost:.2f}")
+            print(f"   💸 Saved: {saved:.2f}")
+            print(f"   📉 Savings %: {(saved / (cost + saved)) * 100:.1f}%")
+            if not implicit_chunks:
+                print("   ⚡ Implicit Cache Hit: N/A (no implicit chunks)")
+            else:
+                print(f"   ⚡ Implicit Cache Hit: {'Yes' if implicit_hit else f'No (missed at chunk ' + str(miss_pos) + ')'}")
+
+    net_cost = total_query_cost + total_upload_cost
+
+    print("\n=== 📊 FINAL SUMMARY ===")
+    print(f"Total Queries: {len(queries_raw)}")
+    print(f"Total Tokens Processed: {total_tokens}")
+    print(f"Total Upload Cost (Explicit Cache): {total_upload_cost:.2f}")
+    print(f"Total Query Cost: {total_query_cost:.2f}")
+    print(f"Total Saved via Cache: {total_saved:.2f}")
+    print(f"Net Cost After Savings: {net_cost:.2f}")
+    print(f"Overall Savings: {(total_saved / (total_saved + net_cost)) * 100:.2f}%")
 
 if __name__ == "__main__":
     main()
