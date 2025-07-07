@@ -7,7 +7,7 @@ from pathlib import Path
 # === CONFIG ===
 CHUNKS_PATH         = Path("chunks.json")
 QUERIES_PATH        = Path("queries.json")
-MAX_BATCH_SIZE      = 4
+MAX_BATCH_SIZE      = 5
 CACHE_DISCOUNT      = 0.25    # pay 25% for explicit‐cached tokens
 IMPLICIT_THRESHOLD  = 1024    # min tokens for implicit dynamic caching
 CACHE_TTL           = 3600    # seconds (simulated TTL)

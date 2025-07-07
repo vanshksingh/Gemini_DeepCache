@@ -1,193 +1,150 @@
 import json
+import time
 import math
-from collections import Counter, defaultdict
+from collections import defaultdict, Counter
+from pathlib import Path
 
-# ---- CONFIG ----
-EXPLICIT_TOKEN_BUDGET = 100
-WORDS_PER_TOKEN = 1 / 0.75
-TOKEN_COST = 1.0
-MAX_GROUP_SIZE = 5
-IMPLICIT_TOKEN_LIMIT = 8192
+# === CONFIG ===
+CHUNKS_PATH        = Path("chunks.json")
+QUERIES_PATH       = Path("queries.json")
+MAX_BATCH_SIZE     = 5
+CACHE_DISCOUNT     = 0.25    # pay 25% for explicit‐cached tokens
+IMPLICIT_THRESHOLD = 100    # min tokens for implicit dynamic caching
+CACHE_TTL          = 3600    # seconds (simulated TTL)
 
-# ---- LOADERS ----
-def load_json_file(file_path):
-    with open(file_path, "r") as f:
-        return json.load(f)
+# === HELPERS ===
+def estimate_tokens(text: str) -> int:
+    return round(len(text.strip().split()) / 0.75)
 
-def estimate_tokens(text):
-    return math.ceil(len(text.split()) / WORDS_PER_TOKEN)
+def jaccard(a, b):
+    a, b = set(a), set(b)
+    return len(a & b) / len(a | b) if a | b else 0
 
-def load_chunks(chunks_raw):
-    return {
-        cid: {"text": text, "tokens": estimate_tokens(text)}
-        for cid, text in chunks_raw.items()
-    }
+# === LOAD INPUT ===
+chunk_data      = json.load(open(CHUNKS_PATH))
+query_to_chunks = json.load(open(QUERIES_PATH))
 
-# ---- HELPERS ----
-def count_chunk_usage(queries):
-    usage = Counter()
-    for chunk_ids in queries.values():
-        usage.update(chunk_ids)
-    return usage
+# === DYNAMIC CORE SELECTION ===
+# Count how many generate calls each chunk would appear in:
+# We assume one call per query group before batching.
+query_freq = Counter()
+for chunks in query_to_chunks.values():
+    query_freq.update(chunks)
 
-def select_explicit_chunks(chunks, usage, token_budget):
-    sorted_chunks = sorted(
-        chunks.items(),
-        key=lambda item: usage[item[0]] * item[1]["tokens"],
-        reverse=True,
-    )
-    selected = {}
-    total = 0
-    for cid, data in sorted_chunks:
-        if total + data["tokens"] <= token_budget:
-            selected[cid] = data
-            total += data["tokens"]
-    return selected
+# Estimate number of batches per query as ceil(1/MAX_BATCH_SIZE),
+# but we can approximate f_c ≈ query_freq[c] / MAX_BATCH_SIZE (rounded up)
+batch_freq = {c: math.ceil(f / MAX_BATCH_SIZE)
+              for c, f in query_freq.items()}
 
-def group_queries(queries, max_size=MAX_GROUP_SIZE):
-    items = list(queries.items())
-    return [dict(items[i:i+max_size]) for i in range(0, len(items), max_size)]
+# Compute per-chunk benefit of explicit caching:
+# benefit = (batch_freq[c] * chunk_tokens * (1 - discount)) - chunk_tokens
+chunk_tokens = {c: estimate_tokens(t) for c, t in chunk_data.items()}
+core_chunks = {
+    c for c, f in batch_freq.items()
+    if (f * chunk_tokens[c] * (1 - CACHE_DISCOUNT) - chunk_tokens[c]) > 0
+}
+core_tokens = sum(chunk_tokens[c] for c in core_chunks)
 
-def plan_global_implicit_cache(all_queries, chunks, current_explicit):
-    chunk_scores = Counter()
-    for q_chunks in all_queries.values():
-        for i, cid in enumerate(q_chunks):
-            if cid not in current_explicit:
-                chunk_scores[cid] += 1 / (i + 1)
+# === BUILD BATCHES OF DYNAMIC PREFIXES ===
+dynamic_map = defaultdict(list)
+for q, chunks in query_to_chunks.items():
+    dyn = tuple(sorted(set(chunks) - core_chunks))
+    dynamic_map[dyn].append(q)
 
-    sorted_chunks = sorted(
-        chunk_scores.items(),
-        key=lambda item: (item[1], -chunks[item[0]]['tokens']),
-        reverse=True
-    )
+batches = []
+for dyn, qs in dynamic_map.items():
+    for i in range(0, len(qs), MAX_BATCH_SIZE):
+        batches.append({
+            "dynamic_chunks": dyn,
+            "queries":        qs[i:i+MAX_BATCH_SIZE]
+        })
 
-    implicit_cache = []
-    total_tokens = 0
-    for cid, _ in sorted_chunks:
-        tokens = chunks[cid]['tokens']
-        if total_tokens + tokens <= IMPLICIT_TOKEN_LIMIT:
-            implicit_cache.append(cid)
-            total_tokens += tokens
-        else:
-            break
+# === ORDER BATCHES FOR IMPLICIT HITS ===
+remaining = batches.copy()
+ordered = [remaining.pop(0)]
+while remaining:
+    last = ordered[-1]["dynamic_chunks"]
+    nxt = max(remaining, key=lambda b: jaccard(last, b["dynamic_chunks"]))
+    remaining.remove(nxt)
+    ordered.append(nxt)
 
-    return implicit_cache
+# === SIMULATION ===
+plan       = []
+total_raw  = 0
+total_opt  = 0
+now        = time.time()
+implicit_registry = {}
 
-# ---- COST SIMULATION ----
-def compute_query_cost(query_chunks, chunks, explicit_chunks, seen_explicit, seen_implicit_ordered):
-    total_tokens = 0
-    query_cost = 0
-    query_saved = 0
+def simulate_implicit(prefix: tuple) -> int:
+    key = prefix
+    tok = sum(chunk_tokens[c] for c in prefix)
+    last = implicit_registry.get(key)
+    if last and (now - last) < CACHE_TTL:
+        implicit_registry[key] = now
+        return tok
+    implicit_registry[key] = now
+    return 0
 
-    explicit_ids = set(explicit_chunks.keys())
-    implicit_chunks = [cid for cid in query_chunks if cid not in explicit_ids]
+# 1) Create explicit cache for core once
+if core_chunks:
+    plan.append({
+        "action":     "create_explicit_cache",
+        "chunk_ids":  sorted(core_chunks),
+        "ctx_tokens": core_tokens,
+        "ttl":        CACHE_TTL
+    })
+    total_opt += core_tokens
 
-    for cid in query_chunks:
-        if cid in explicit_ids:
-            tokens = chunks[cid]["tokens"]
-            total_tokens += tokens
-            if cid in seen_explicit:
-                query_cost += tokens * 0.25
-                query_saved += tokens * 0.75
-            else:
-                query_cost += tokens
-            seen_explicit.add(cid)
+# 2) Process each dynamic batch
+for gid, batch in enumerate(ordered, start=1):
+    dyn     = batch["dynamic_chunks"]
+    dyn_tok = sum(chunk_tokens[c] for c in dyn)
+    q_tok   = sum(estimate_tokens(q) for q in batch["queries"])
 
-    hit_stop = None
-    for i, cid in enumerate(implicit_chunks):
-        tokens = chunks[cid]["tokens"]
-        total_tokens += tokens
+    # raw = core + dynamic + queries
+    raw = core_tokens + dyn_tok + q_tok
+    total_raw += raw
 
-        if i < len(seen_implicit_ordered) and cid == seen_implicit_ordered[i] and hit_stop is None:
-            query_cost += tokens * 0.25
-            query_saved += tokens * 0.75
-        else:
-            if hit_stop is None:
-                hit_stop = i
-            query_cost += tokens
+    # implicit dynamic hits
+    imp_hits = simulate_implicit(dyn) if dyn_tok >= IMPLICIT_THRESHOLD else 0
 
-    if hit_stop == 0:
-        hit_stop = len(implicit_chunks)
+    # explicit core hits & cost
+    exp_hits = core_tokens
+    exp_cost = core_tokens * CACHE_DISCOUNT if core_chunks else 0
 
-    return total_tokens, query_cost, query_saved, implicit_chunks, hit_stop
+    # uncached dynamic tokens
+    uncached_dyn = max(0, dyn_tok - imp_hits)
+    sent = uncached_dyn + q_tok
 
-# ---- MAIN ----
-def main():
-    chunks_raw = load_json_file("chunks.json")
-    queries_raw = load_json_file("queries.json")
-    chunks = load_chunks(chunks_raw)
+    # charge generate: sent tokens + explicit discount
+    total_opt += sent + exp_cost
 
-    grouped = group_queries(queries_raw)
-    seen_explicit = set()
-    seen_implicit_ordered = []
-    current_explicit = {}
-    total_upload_cost = 0
-    total_query_cost = 0
-    total_tokens = 0
-    total_saved = 0
+    plan.append({
+        "action":                "generate_content",
+        "group_id":              gid,
+        "batch_queries":         batch["queries"],
+        "core_explicit":         bool(core_chunks),
+        "implicit_dynamic_hits": imp_hits,
+        "explicit_cost":         exp_cost,
+        "dynamic_tokens":        dyn_tok,
+        "uncached_dynamic":      uncached_dyn,
+        "query_tokens":          q_tok,
+        "sent_tokens":           sent
+    })
 
-    print("\n=== 🚀 CACHE PLAN EXECUTION ===")
+# 3) Delete explicit cache at end
+if core_chunks:
+    plan.append({
+        "action":    "delete_explicit_cache",
+        "chunk_ids": sorted(core_chunks)
+    })
 
-    usage = count_chunk_usage(queries_raw)
-    current_explicit = select_explicit_chunks(chunks, usage, EXPLICIT_TOKEN_BUDGET)
-    seen_implicit_ordered = plan_global_implicit_cache(queries_raw, chunks, current_explicit)
-
-    print(f"\n🔁 Explicit Cache Selected (Upload cost: {sum(chunks[cid]['tokens'] for cid in current_explicit):.2f})")
-    for cid in current_explicit:
-        print(f"  - {cid}")
-
-    print(f"\n🧠 Global Implicit Cache Plan: {len(seen_implicit_ordered)} chunks")
-    for i, cid in enumerate(seen_implicit_ordered):
-        print(f"   #{i+1}: {cid}")
-
-    for group_index, group in enumerate(grouped):
-        print(f"\n=== 🧩 Group {group_index+1} ===")
-        group_tokens = group_cost = group_saved = 0
-        print("\n📡 Simulating API Call for Group")
-
-        for query, chunk_list in group.items():
-            tokens, cost, saved, implicit_chunks, hit_stop = compute_query_cost(
-                chunk_list, chunks, current_explicit,
-                seen_explicit, seen_implicit_ordered
-            )
-
-            group_tokens += tokens
-            group_cost += cost
-            group_saved += saved
-
-            total_tokens += tokens
-            total_query_cost += cost
-            total_saved += saved
-
-            print(f"\n🔍 Query: {query}")
-            print(f"   Implicit Chunks: {implicit_chunks if implicit_chunks else 'None'}")
-            print(f"   🔢 Tokens: {tokens}")
-            print(f"   💰 Cost: {cost:.2f}")
-            print(f"   💸 Saved: {saved:.2f}")
-            savings_pct = (saved / (saved + cost)) * 100 if (saved + cost) > 0 else 0.0
-            print(f"   📉 Savings %: {savings_pct:.1f}%")
-            if not implicit_chunks:
-                print(f"   ⚡ Implicit Cache Hit: N/A (no implicit chunks)")
-            elif hit_stop == len(implicit_chunks):
-                print(f"   ⚡ Implicit Cache Hit: ❌ Full Miss")
-            elif hit_stop is None:
-                print(f"   ⚡ Implicit Cache Hit: ✅ Full")
-            else:
-                print(f"   ⚡ Implicit Cache Hit: ⚠️ Partial (miss at chunk #{hit_stop + 1} → {implicit_chunks[hit_stop]})")
-
-        print(f"\n📦 Group Summary: Tokens={group_tokens}, Cost={group_cost:.2f}, Saved={group_saved:.2f}")
-
-    net_cost = total_upload_cost + total_query_cost
-    overall_savings_pct = (total_saved / (total_saved + net_cost)) * 100 if (total_saved + net_cost) > 0 else 0.0
-
-    print("\n=== 📊 FINAL SUMMARY ===")
-    print(f"Total Queries: {len(queries_raw)}")
-    print(f"Total Tokens Processed: {total_tokens}")
-    print(f"Total Upload Cost (Explicit Cache): {total_upload_cost:.2f}")
-    print(f"Total Query Cost: {total_query_cost:.2f}")
-    print(f"Total Saved via Cache: {total_saved:.2f}")
-    print(f"Net Cost After Savings: {net_cost:.2f}")
-    print(f"Overall Savings: {overall_savings_pct:.2f}%")
-
-if __name__ == "__main__":
-    main()
+# === OUTPUT ===
+print("✅ Simulation Plan:")
+for step in plan:
+    print(json.dumps(step, ensure_ascii=False))
+print("\n📊 Cost Summary:")
+print(f"  Raw tokens sent     : {total_raw}")
+print(f"  Optimized token cost: {total_opt}")
+print(f"  Savings             : {total_raw - total_opt} tokens "
+      f"({(100*(total_raw-total_opt)/total_raw):.2f}%)")
