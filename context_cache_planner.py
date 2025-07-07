@@ -1,130 +1,123 @@
-from collections import defaultdict
-from itertools import combinations
+import json
+from collections import defaultdict, Counter
+from pathlib import Path
 
-# === STEP 1: INPUTS ===
+# === CONFIG ===
+CHUNKS_PATH = Path("chunks.json")
+QUERIES_PATH = Path("queries.json")
+QUERY_COST_PER_TOKEN = 1.0
+CHUNK_COST_PER_TOKEN = 1.0
+CACHE_DISCOUNT = 0.25
+TOP_K_IMPORTANT_CHUNKS = 3
+MAX_BATCH_SIZE = 4
 
-# Expanded example with more diversity
-query_to_chunks = {
-    "How do I play music?": ["chunk1", "chunk2"],
-    "Connect Bluetooth to play songs": ["chunk1", "chunk2"],
-    "Use voice to change music": ["chunk1", "chunk3"],
-    "Where is the map icon?": ["chunk4", "chunk5"],
-    "What does the navigation button do?": ["chunk4", "chunk5"],
-    "Set destination using touchscreen": ["chunk5", "chunk6"],
-    "Adjust the fan speed": ["chunk7", "chunk8"],
-    "Change the temperature in the car": ["chunk7", "chunk9"],
-    "Access climate control from the screen": ["chunk8", "chunk9"],
-    "Activate defrost mode": ["chunk8", "chunk10"],
-    "Open sunroof": ["chunk11", "chunk12"],
-    "Check tire pressure": ["chunk13", "chunk14"]
-}
+# === LOAD DATA ===
+with open(CHUNKS_PATH) as f:
+    chunk_data = json.load(f)
 
-# Semantic similarity pairs (grouped by meaning even if chunk overlap is low)
-semantic_pairs = [
-    {"How do I play music?", "Connect Bluetooth to play songs"},
-    {"Where is the map icon?", "What does the navigation button do?"},
-    {"Change the temperature in the car", "Access climate control from the screen"},
-    {"Adjust the fan speed", "Activate defrost mode"},
-    {"Use voice to change music", "Set destination using touchscreen"}
-]
+with open(QUERIES_PATH) as f:
+    query_to_chunks = json.load(f)
 
-# Thresholds
-JACCARD_SIM_THRESHOLD = 0.5
-MIN_GROUP_SIZE = 2
+# === TOKENIZER ===
+def estimate_tokens(text):
+    return round(len(text.strip().split()) / 0.75)
 
-# === STEP 2: Build Graph from Chunk Overlap ===
+chunk_token_counts = {cid: estimate_tokens(text) for cid, text in chunk_data.items()}
+chunk_token_texts = {cid: text for cid, text in chunk_data.items()}
 
-def jaccard_similarity(set1, set2):
-    return len(set1 & set2) / len(set1 | set2)
+# === Rank important chunks by frequency and query order weight ===
+chunk_usage_freq = Counter()
+query_to_index = {q: i for i, q in enumerate(query_to_chunks)}
 
-query_graph = defaultdict(set)
-query_list = list(query_to_chunks.keys())
+for query, chunks in query_to_chunks.items():
+    weight = len(query_to_chunks) - query_to_index[query]  # earlier queries have more weight
+    for chunk in chunks:
+        chunk_usage_freq[chunk] += weight
 
-# Add edges based on chunk overlap
-for q1, q2 in combinations(query_list, 2):
-    chunks1 = set(query_to_chunks[q1])
-    chunks2 = set(query_to_chunks[q2])
-    if jaccard_similarity(chunks1, chunks2) >= JACCARD_SIM_THRESHOLD:
-        query_graph[q1].add(q2)
-        query_graph[q2].add(q1)
+IMPORTANT_CHUNKS = set([cid for cid, _ in chunk_usage_freq.most_common(TOP_K_IMPORTANT_CHUNKS)])
+print(f"🚨 Top-{TOP_K_IMPORTANT_CHUNKS} Important Chunks: {IMPORTANT_CHUNKS}")
 
-# === STEP 3: Add Semantic Similarity Links ===
+# === Group similar queries based on shared chunk sets ===
+chunk_to_queries = defaultdict(list)
+for query, chunks in query_to_chunks.items():
+    key = tuple(sorted(chunks))
+    chunk_to_queries[key].append(query)
 
-for pair in semantic_pairs:
-    q1, q2 = tuple(pair)
-    query_graph[q1].add(q2)
-    query_graph[q2].add(q1)
+sorted_groups = sorted(chunk_to_queries.items(), key=lambda kv: (-len(kv[1]), -len(set(kv[0]) & IMPORTANT_CHUNKS)))
 
-# === STEP 4: Group Queries into Clusters ===
+execution_plan = []
+raw_cost = 0.0
+optimized_cost = 0.0
+current_explicit = set()
 
-def build_clusters(graph):
-    visited = set()
-    clusters = []
-    for node in graph:
-        if node not in visited:
-            cluster = set()
-            stack = [node]
-            while stack:
-                current = stack.pop()
-                if current not in visited:
-                    visited.add(current)
-                    cluster.add(current)
-                    stack.extend(graph[current] - visited)
-            if len(cluster) >= MIN_GROUP_SIZE:
-                clusters.append(cluster)
-    return clusters
+for i, (chunk_key, queries) in enumerate(sorted_groups, 1):
+    grouped_queries = [queries[j:j+MAX_BATCH_SIZE] for j in range(0, len(queries), MAX_BATCH_SIZE)]
+    for batch in grouped_queries:
+        batch_chunk_set = set(chunk_key)
+        chunk_tokens = sum(chunk_token_counts[c] for c in chunk_key)
+        query_tokens = sum(estimate_tokens(q) for q in batch)
+        batch_size = len(batch)
+        raw_batch_cost = (chunk_tokens + query_tokens + 1) * batch_size
+        raw_cost += raw_batch_cost
 
-explicit_cache_clusters = build_clusters(query_graph)
+        use_explicit = False
+        reuse_explicit = False
 
-# === STEP 5: Collect Shared Chunks per Cluster ===
+        if not current_explicit:
+            use_explicit = True
+        elif len(current_explicit & batch_chunk_set) >= TOP_K_IMPORTANT_CHUNKS - 1:
+            reuse_explicit = True
+        else:
+            use_explicit = True
 
-explicit_cache_plan = []
-explicit_cache_chunks = set()
+        if use_explicit:
+            current_explicit = batch_chunk_set
+            explicit_cost = chunk_tokens * CHUNK_COST_PER_TOKEN
+            reuse_cost = chunk_tokens * CACHE_DISCOUNT * (batch_size - 1)
+        elif reuse_explicit:
+            explicit_cost = 0
+            reuse_cost = chunk_tokens * CACHE_DISCOUNT * batch_size
+        else:
+            explicit_cost = chunk_tokens * CHUNK_COST_PER_TOKEN
+            reuse_cost = chunk_tokens * CACHE_DISCOUNT * (batch_size - 1)
 
-for cluster in explicit_cache_clusters:
-    cluster_chunks = set()
-    for q in cluster:
-        cluster_chunks.update(query_to_chunks[q])
-    explicit_cache_plan.append({
-        "queries": list(cluster),
-        "shared_chunks": list(cluster_chunks)
-    })
-    explicit_cache_chunks.update(cluster_chunks)
+        query_cost = query_tokens * QUERY_COST_PER_TOKEN
+        optimized_batch_cost = explicit_cost + reuse_cost + query_cost
+        optimized_cost += optimized_batch_cost
 
-# === STEP 6: Identify Leftover Queries ===
+        execution_plan.append({
+            "group_id": i,
+            "chunks": list(chunk_key),
+            "queries": batch,
+            "explicit_used": use_explicit,
+            "reuse_explicit": reuse_explicit,
+            "explicit_cost": explicit_cost,
+            "reuse_cost": reuse_cost,
+            "query_cost": query_cost,
+            "chunk_token_count": chunk_tokens,
+            "query_token_count": query_tokens,
+            "batch_size": batch_size
+        })
 
-all_queries = set(query_to_chunks.keys())
-used_queries = set(q for group in explicit_cache_plan for q in group["queries"])
-implicit_cache_queries = list(all_queries - used_queries)
-
-implicit_cache_chunks = set()
-for q in implicit_cache_queries:
-    implicit_cache_chunks.update(query_to_chunks[q])
-
-# === STEP 7: Verbose Output ===
-
-print("\n📦 Explicit Cache Plan (Shared Cache Groups):")
-for idx, plan in enumerate(explicit_cache_plan, 1):
-    print(f"\n🔹 Group {idx} (Total Queries: {len(plan['queries'])}, Chunks: {len(plan['shared_chunks'])})")
-    print("  Queries:")
+# === OUTPUT ===
+print("\n📦 Execution Plan with Grouped Queries:")
+for plan in execution_plan:
+    print(f"\n🔹 Group {plan['group_id']}:")
+    for cid in plan['chunks']:
+        if cid in current_explicit:
+            print(f"     🔐 Explicit Chunk: {cid}")
+        else:
+            print(f"     💭 Implicit Chunk: {cid}")
+    print(f"   🔄 Queries in batch: {len(plan['queries'])}")
+    print(f"   Query Token Total: {plan['query_token_count']}")
+    print(f"   Chunk Token Total: {plan['chunk_token_count']}")
+    print(f"   🔐 Explicit Cache: {plan['explicit_used']} | ♻️ Reuse: {plan['reuse_explicit']}")
+    print(f"   💰 Explicit Cost: {plan['explicit_cost']:.2f}, Reuse Cost: {plan['reuse_cost']:.2f}, Query Cost: {plan['query_cost']:.2f}")
+    print(f"   🔍 Queries:")
     for q in plan['queries']:
-        print(f"    - {q}")
-    print("  Shared Chunks:")
-    for ch in plan['shared_chunks']:
-        print(f"    - {ch}")
-    chunk_counts = {ch: sum(ch in query_to_chunks[q] for q in plan['queries']) for ch in plan['shared_chunks']}
-    print("  Chunk Usage Frequency:")
-    for ch, count in chunk_counts.items():
-        print(f"    - {ch}: used in {count} queries")
+        print(f"      - {q}")
 
-print("\n💨 Implicit Cache (One-off or Diverse Queries):")
-if not implicit_cache_queries:
-    print("  ✅ No queries need implicit caching — all queries are covered by shared chunk groups.")
-else:
-    print(f"  Total: {len(implicit_cache_queries)}")
-    print("  Queries:")
-    for q in implicit_cache_queries:
-        print(f"    - {q}")
-    print("  Chunks:")
-    for ch in implicit_cache_chunks:
-        print(f"    - {ch}")
+print("\n📊 Final Cost Report:")
+print(f"   Raw cost (no cache): {raw_cost:.2f} tokens")
+print(f"   Optimized cost     : {optimized_cost:.2f} tokens")
+print(f"   💸 Savings         : {raw_cost - optimized_cost:.2f} tokens ({(100 * (raw_cost - optimized_cost) / raw_cost):.2f}%)")
