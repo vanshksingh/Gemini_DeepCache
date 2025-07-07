@@ -35,9 +35,6 @@ logging.basicConfig(level=config.log_level, format="%(asctime)s %(levelname)s:%(
 
 # === ASYNC TOKEN COUNTER ===
 async def count_tokens_async(texts: List[str]) -> Dict[str, int]:
-    """
-    Count tokens for each text in parallel and unwrap the CountTokensResponse.
-    """
     loop = asyncio.get_running_loop()
     async def worker(txt: str) -> Tuple[str, int]:
         resp = await loop.run_in_executor(
@@ -142,8 +139,6 @@ class Simulator:
             })
             self.total_opt += core_tok
             use_explicit = True
-        else:
-            logging.info("Skipping explicit cache (not cost-effective).")
 
         for gid, batch in enumerate(ordered, start=1):
             dyn = batch["dynamic_chunks"]
@@ -160,7 +155,6 @@ class Simulator:
             self.total_opt += opt
 
             pct = 100 * (raw - opt) / raw if raw else 0
-            logging.info(f"Batch {gid}: raw={raw}, opt={opt:.2f} ({pct:.1f}% saving)")
             self.plan.append({
                 "action":           "generate_content",
                 "group_id":         gid,
@@ -172,7 +166,8 @@ class Simulator:
                 "uncached_dynamic": unc,
                 "query_tokens":     q_tok,
                 "sent_tokens":      sent,
-                "batch_saving_pct": round(pct, 1)
+                "batch_saving_pct": round(pct, 1),
+                "implicit_order":   dyn  # record the order of implicit chunks
             })
 
         if use_explicit:
@@ -192,11 +187,6 @@ async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--max-batch-size", type=int)
     parser.add_argument("--implicit-threshold", type=int)
-    parser.add_argument("--sweep-batch-sizes", type=str,
-                        help="comma-separated batch sizes for auto-tune")
-    parser.add_argument("--sweep-thresholds", type=str,
-                        help="comma-separated thresholds for auto-tune")
-    parser.add_argument("--do-sweep", action="store_true")
     args = parser.parse_args()
 
     if args.max_batch_size:
@@ -208,7 +198,6 @@ async def main():
     queries = json.loads(config.queries_path.read_text())
     core = compute_core_chunks(queries)
 
-    # async token counts
     raw_chunks = [chunks[cid] for cid in chunks]
     chunk_map = await count_tokens_async(raw_chunks)
     global chunk_tokens
@@ -216,45 +205,23 @@ async def main():
 
     query_keys = list(queries.keys())
     query_map_counts = await count_tokens_async(query_keys)
+    global query_tokens
     query_tokens = {q: query_map_counts[q] for q in queries}
-
-    if args.do_sweep and args.sweep_batch_sizes and args.sweep_thresholds:
-        bs_list = [int(x) for x in args.sweep_batch_sizes.split(",")]
-        thr_list = [int(x) for x in args.sweep_thresholds.split(",")]
-        best = []
-        for bs in bs_list:
-            for thr in thr_list:
-                config.max_batch_size = bs
-                config.implicit_threshold = thr
-                sim = Simulator(chunks, queries, core, chunk_tokens, query_tokens)
-                sim.run()
-                pct = 100 * (sim.total_raw - sim.total_opt) / sim.total_raw if sim.total_raw else 0
-                best.append((bs, thr, pct))
-                logging.info(f"Sweep bs={bs}, thr={thr} → saving {pct:.1f}%")
-        best.sort(key=lambda x: -x[2])
-        print("Top configs:", best[:3])
-        return
 
     sim = Simulator(chunks, queries, core, chunk_tokens, query_tokens)
     sim.run()
     sim.report()
+    return {
+        "explicit_cache": [step for step in sim.plan if step["action"] == "create_explicit_cache"],
+        "batches": [step for step in sim.plan if step["action"] == "generate_content"],
+        "cleanup": [step for step in sim.plan if step["action"] == "delete_explicit_cache"],
+    }
 
-# === CONFIG TUNERS INJECTION & ENTRY POINT ===
 if __name__ == "__main__":
-    # —————— CONFIG TUNERS ——————
-    config.max_batch_size     = 7
-    config.implicit_threshold = 2048
+    # Optionally override defaults here, or supply flags instead
+    # config.max_batch_size = 7
+    # config.implicit_threshold = 2048
 
-    # to auto-tune by default, uncomment these two:
-    SWEEP_BATCH_SIZES = "3,5,7"
-    SWEEP_THRESHOLDS  = "512,1024,2048"
-
-    import sys
-    sys.argv += [
-        "--do-sweep",
-        "--sweep-batch-sizes", SWEEP_BATCH_SIZES,
-        "--sweep-thresholds",  SWEEP_THRESHOLDS,
-    ]
-    # ————————————————————————
-
-    asyncio.run(main())
+    plan_output = asyncio.run(main())
+    # Print full JSON plan, including explicit, implicit order, and queries
+    print(json.dumps(plan_output, indent=2))
