@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -15,8 +16,7 @@ TOP_K_DEFAULT = 10
 DB_PATH = "./chroma_store"
 
 
-def load_gemini_client() -> genai.Client:
-    """Load environment and initialize Gemini client."""
+def _load_gemini_client_sync() -> genai.Client:
     load_dotenv()
     return genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
@@ -59,26 +59,33 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
     ]
 
 
-def get_or_create_chroma_db(
+async def load_gemini_client() -> genai.Client:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _load_gemini_client_sync)
+
+
+async def get_or_create_chroma_db(
     client: genai.Client,
     db_name: str,
     embedding_fn: EmbeddingFunction,
     clear: bool = False
 ):
-    """Get or create a persistent ChromaDB collection."""
-    store = chromadb.PersistentClient(path=DB_PATH)
-    if clear:
-        try:
-            store.delete_collection(name=db_name)
-        except ValueError:
-            pass
-    return store.get_or_create_collection(
-        name=db_name,
-        embedding_function=embedding_fn
-    )
+    loop = asyncio.get_running_loop()
+    def _sync():
+        store = chromadb.PersistentClient(path=DB_PATH)
+        if clear:
+            try:
+                store.delete_collection(name=db_name)
+            except ValueError:
+                pass
+        return store.get_or_create_collection(
+            name=db_name,
+            embedding_function=embedding_fn
+        )
+    return await loop.run_in_executor(None, _sync)
 
 
-def generate_chunk_and_query_mappings(
+async def generate_chunk_and_query_mappings(
     *,
     text_file: str,
     queries_file: str,
@@ -89,18 +96,12 @@ def generate_chunk_and_query_mappings(
     top_k: int = TOP_K_DEFAULT,
     db_name: str = "document_db"
 ) -> tuple[dict[str, str], dict[str, list[str]]]:
-    """
-    Read a text file and a JSON file with queries, then:
-    1) Chunk the text and write a JSON mapping chunk IDs to chunk text.
-    2) Retrieve top-k chunk IDs for each query and write a JSON mapping queries to lists of chunk IDs.
-    Returns the two mappings.
-    """
-    # initialize client and DB
-    client = load_gemini_client()
+    # 1. Init client & DB
+    client = await load_gemini_client()
     ef = GeminiEmbeddingFunction(client=client, task_type="RETRIEVAL_DOCUMENT")
-    db = get_or_create_chroma_db(client, db_name, ef, clear=True)
+    db = await get_or_create_chroma_db(client, db_name, ef, clear=True)
 
-    # load and chunk document
+    # 2. Read & chunk document
     text = Path(text_file).read_text(encoding="utf-8")
     chunks = chunk_text(text, chunk_size, overlap)
     chunk_map = {
@@ -108,36 +109,42 @@ def generate_chunk_and_query_mappings(
         for i, chunk in enumerate(chunks)
     }
 
-    # add to ChromaDB
-    db.add(
-        ids=list(chunk_map.keys()),
-        documents=list(chunk_map.values())
+    # 3. Add chunks to DB (sync)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None,
+        lambda: db.add(ids=list(chunk_map.keys()),
+                        documents=list(chunk_map.values()))
     )
 
-    # load queries
+    # 4. Load queries
     raw = json.loads(Path(queries_file).read_text(encoding="utf-8"))
-    # support either list or dict of queries
     queries = list(raw) if isinstance(raw, dict) else raw
 
-    # retrieve top-k chunk IDs per query
-    query_map: dict[str, list[str]] = {}
-    for q in queries:
-        result = db.query(query_texts=[q], n_results=top_k)
-        ids = result.get("ids", [[]])[0]
-        query_map[q] = ids
+    # 5. Query top-k in parallel
+    async def fetch_ids(q: str) -> tuple[str, list[str]]:
+        res = await loop.run_in_executor(
+            None,
+            lambda: db.query(query_texts=[q], n_results=top_k)
+        )
+        return q, res.get("ids", [[]])[0]
 
-    # write outputs
-    Path(output_chunk_json).write_text(json.dumps(chunk_map, indent=2), encoding="utf-8")
-    Path(output_query_json).write_text(json.dumps(query_map, indent=2), encoding="utf-8")
+    tasks = [fetch_ids(q) for q in queries]
+    query_map = dict(await asyncio.gather(*tasks))
+
+    # 6. Write outputs
+    Path(output_chunk_json).write_text(
+        json.dumps(chunk_map, indent=2), encoding="utf-8"
+    )
+    Path(output_query_json).write_text(
+        json.dumps(query_map, indent=2), encoding="utf-8"
+    )
 
     return chunk_map, query_map
 
 
-if __name__ == "__main__":
-    # Example usage:
-    #   put your long document in "document.txt"
-    #   put your queries list or dict in "queries.json"
-    chunk_mapping, query_mapping = generate_chunk_and_query_mappings(
+async def main():
+    chunk_mapping, query_mapping = await generate_chunk_and_query_mappings(
         text_file="example_document.txt",
         queries_file="example_queries.json",
         output_chunk_json="chunks.json",
@@ -145,6 +152,10 @@ if __name__ == "__main__":
         chunk_size=200,
         overlap=40,
         top_k=10,
-        db_name="my_doc_db"
+        db_name="my_async_db"
     )
-    print("Generated chunks.json and queries.json")
+    print(f"Generated {len(chunk_mapping)} chunks and mapped {len(query_mapping)} queries")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
