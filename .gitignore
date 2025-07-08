@@ -3,3 +3,4 @@
 /chroma_store
 chunks.json
 queries.json
+implicit_registry.pkl
