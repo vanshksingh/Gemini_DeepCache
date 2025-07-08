@@ -1,139 +1,213 @@
+import os
 import json
 import time
-import math
-from collections import defaultdict, Counter
+import logging
+import pickle
+from collections import Counter, defaultdict
 from pathlib import Path
+from dotenv import load_dotenv
 
-# === CONFIG ===
-CHUNKS_PATH         = Path("chunks.json")
-QUERIES_PATH        = Path("queries.json")
-MAX_BATCH_SIZE      = 5
-CACHE_DISCOUNT      = 0.25    # pay 25% for explicit‐cached tokens
-IMPLICIT_THRESHOLD  = 1024    # min tokens for implicit dynamic caching
-CACHE_TTL           = 3600    # seconds (simulated TTL)
 
-# === HELPERS ===
-def estimate_tokens(text: str) -> int:
-    return round(len(text.strip().split()) / 0.75)
+def plan_batches(
+    chunk_texts_data,
+    query_map_data,
+    max_batch_size=5,
+    implicit_threshold=1024,
+    cache_discount=0.25,
+    cache_ttl=3600,
+    registry_path="implicit_registry.pkl",
+    min_explicit_chunks=1,
+    max_explicit_chunks=50,
+    min_implicit_threshold=225,
+    max_implicit_threshold=4096,
+    min_cache_ttl=600,
+    max_cache_ttl=86400,
+    token_ratio=0.75,
+    log_level=logging.WARNING
+):
+    """
+    Simulate batching and caching of context chunks for API calls with constraint enforcement.
 
-def jaccard(a, b):
-    a, b = set(a), set(b)
-    return len(a & b) / len(a | b) if a | b else 0
+    Parameters:
+    - chunk_texts_data: dict mapping chunk_id to text
+    - query_map_data: dict mapping query text to list of chunk_ids
+    - max_batch_size: max number of queries per batch
+    - implicit_threshold: desired threshold for implicit cache (tokens)
+    - cache_discount: fraction paid for explicit-cached tokens
+    - cache_ttl: desired implicit cache TTL (seconds)
+    - registry_path: file path to persist implicit cache registry
+    - min_explicit_chunks: min core chunks to create explicit cache
+    - max_explicit_chunks: max core chunks allowed for explicit cache
+    - min_implicit_threshold: lower bound for implicit_threshold
+    - max_implicit_threshold: upper bound for implicit_threshold
+    - min_cache_ttl: lower bound for cache_ttl
+    - max_cache_ttl: upper bound for cache_ttl
+    - token_ratio: ratio of words to tokens
+    - log_level: logging level
+    """
+    # Logging
+    logging.basicConfig(level=log_level)
+    now = time.time()
 
-# === LOAD INPUT ===
-chunk_data      = json.load(open(CHUNKS_PATH))
-query_to_chunks = json.load(open(QUERIES_PATH))
+    # Enforce parameter constraints
+    implicit_threshold = max(min_implicit_threshold, min(implicit_threshold, max_implicit_threshold))
+    cache_ttl = max(min_cache_ttl, min(cache_ttl, max_cache_ttl))
 
-# === DETERMINE CORE CHUNKS ===
-# any chunk used in >1 query becomes “core”
-freq = Counter()
-for chunks in query_to_chunks.values():
-    freq.update(chunks)
-core_chunks = {cid for cid, f in freq.items() if f > 1}
-core_tokens = sum(estimate_tokens(chunk_data[c]) for c in core_chunks)
+    # Load or initialize implicit registry
+    try:
+        with open(registry_path, "rb") as f:
+            implicit_registry = pickle.load(f)
+    except Exception:
+        implicit_registry = {}
 
-# === BUILD BATCHES OF DYNAMIC PREFIXES ===
-dynamic_map = defaultdict(list)
-for q, chunks in query_to_chunks.items():
-    dyn = tuple(sorted(set(chunks) - core_chunks))
-    dynamic_map[dyn].append(q)
+    # Token estimation using configurable ratio
+    def estimate_tokens(text: str) -> int:
+        return round(len(text.strip().split()) / token_ratio)
 
-batches = []
-for dyn, qs in dynamic_map.items():
-    for i in range(0, len(qs), MAX_BATCH_SIZE):
-        batches.append({
-            "dynamic_chunks": dyn,
-            "queries":        qs[i:i+MAX_BATCH_SIZE]
+    # Jaccard similarity for ordering batches
+    def jaccard(a, b):
+        a, b = set(a), set(b)
+        return len(a & b) / len(a | b) if a or b else 0
+
+    # Determine core (explicit) chunks
+    freq = Counter()
+    for chunks in query_map_data.values():
+        freq.update(chunks)
+    core_chunks = {cid for cid, f in freq.items() if f > 1}
+    core_tokens = sum(estimate_tokens(chunk_texts_data[c]) for c in core_chunks)
+
+    plan = {"explicit_cache": [], "batches": [], "cleanup": []}
+    total_raw = 0
+    total_opt = 0
+
+    # Create explicit cache if within bounds
+    num_core = len(core_chunks)
+    if min_explicit_chunks <= num_core <= max_explicit_chunks:
+        plan["explicit_cache"].append({
+            "action": "create_explicit_cache",
+            "chunk_ids": sorted(core_chunks),
+            "ctx_tokens": core_tokens,
+            "ttl": cache_ttl,
+        })
+        total_opt += core_tokens * cache_discount
+
+    # Group queries by their dynamic chunk sets
+    dynamic_map = defaultdict(list)
+    for query, chunks in query_map_data.items():
+        dynamic = tuple(sorted(set(chunks) - core_chunks))
+        dynamic_map[dynamic].append(query)
+
+    # Build and order batches
+    batches = []
+    for dyn, queries in dynamic_map.items():
+        for i in range(0, len(queries), max_batch_size):
+            batches.append({"dynamic_chunks": dyn, "queries": queries[i : i + max_batch_size]})
+    ordered = []
+    if batches:
+        ordered.append(batches.pop(0))
+        while batches:
+            last = ordered[-1]["dynamic_chunks"]
+            nxt = max(batches, key=lambda b: jaccard(last, b["dynamic_chunks"]))
+            batches.remove(nxt)
+            ordered.append(nxt)
+
+    # Helper to simulate implicit cache hits
+    def simulate_implicit(prefix: tuple) -> int:
+        toks = sum(estimate_tokens(chunk_texts_data[c]) for c in prefix)
+        last_time = implicit_registry.get(prefix)
+        if last_time and (now - last_time) < cache_ttl:
+            implicit_registry[prefix] = now
+            return toks
+        implicit_registry[prefix] = now
+        return 0
+
+    # Process each batch
+    for gid, batch in enumerate(ordered, start=1):
+        dyn = batch["dynamic_chunks"]
+        dyn_toks = sum(estimate_tokens(chunk_texts_data[c]) for c in dyn)
+        q_toks = sum(estimate_tokens(q) for q in batch["queries"])
+        raw = core_tokens + dyn_toks + q_toks
+        total_raw += raw
+
+        # Implicit hits only if threshold met
+        imp_hits = simulate_implicit(dyn) if dyn_toks >= implicit_threshold else 0
+        exp_cost = core_tokens * cache_discount if min_explicit_chunks <= num_core <= max_explicit_chunks else 0
+        uncached = max(0, dyn_toks - imp_hits)
+        sent = uncached + q_toks
+        opt_cost = sent + exp_cost
+        total_opt += opt_cost
+
+        save_pct = round((raw - opt_cost) / raw * 100, 1) if raw else 0.0
+
+        plan["batches"].append({
+            "action": "generate_content",
+            "group_id": gid,
+            "batch_queries": batch["queries"],
+            "explicit_used": exp_cost > 0,
+            "explicit_cost": round(exp_cost, 2),
+            "implicit_hits": imp_hits,
+            "dynamic_tokens": dyn_toks,
+            "uncached_dynamic": uncached,
+            "query_tokens": q_toks,
+            "sent_tokens": sent,
+            "batch_saving_pct": save_pct,
+            "implicit_order": list(dyn) if imp_hits else [],
         })
 
-# === ORDER BATCHES FOR IMPLICIT HITS ===
-remaining = batches.copy()
-ordered = [remaining.pop(0)]
-while remaining:
-    last = ordered[-1]["dynamic_chunks"]
-    nxt = max(remaining, key=lambda b: jaccard(last, b["dynamic_chunks"]))
-    remaining.remove(nxt)
-    ordered.append(nxt)
+    # Cleanup explicit cache
+    if min_explicit_chunks <= num_core <= max_explicit_chunks:
+        plan["cleanup"].append({
+            "action": "delete_explicit_cache",
+            "chunk_ids": sorted(core_chunks),
+        })
 
-# === SIMULATION ===
-plan       = []
-total_raw  = 0
-total_opt  = 0
-now        = time.time()
-implicit_registry = {}
+    # Persist implicit registry
+    try:
+        with open(registry_path, "wb") as f:
+            pickle.dump(implicit_registry, f)
+    except Exception:
+        logging.warning("Could not save implicit registry")
 
-def simulate_implicit(prefix: tuple) -> int:
-    """0 if first use, full dynamic token count if within TTL."""
-    key = prefix
-    tok = sum(estimate_tokens(chunk_data[c]) for c in prefix)
-    last = implicit_registry.get(key)
-    if last and (now - last) < CACHE_TTL:
-        implicit_registry[key] = now
-        return tok
-    implicit_registry[key] = now
-    return 0
+    # Summary
+    total_saved = total_raw - total_opt
+    plan["summary"] = {
+        "total_raw_tokens": total_raw,
+        "total_optimized_tokens": total_opt,
+        "total_saved_tokens": total_saved,
+        "saving_percentage": round((total_saved / total_raw) * 100, 1) if total_raw else 0.0,
+    }
 
-# 1) Create one explicit cache for core_chunks
-if core_chunks:
-    plan.append({
-        "action":     "create_explicit_cache",
-        "chunk_ids":  sorted(core_chunks),
-        "ctx_tokens": core_tokens,
-        "ttl":        CACHE_TTL
-    })
-    total_opt += core_tokens
+    return plan
 
-# 2) Process each batch
-for gid, batch in enumerate(ordered, start=1):
-    dyn     = batch["dynamic_chunks"]
-    dyn_tok = sum(estimate_tokens(chunk_data[c]) for c in dyn)
-    q_tok   = sum(estimate_tokens(q) for q in batch["queries"])
 
-    # raw = core + dynamic + queries
-    raw = core_tokens + dyn_tok + q_tok
-    total_raw += raw
+if __name__ == "__main__":
+    load_dotenv()
+    import logging
 
-    # implicit dynamic hits
-    imp_hits = simulate_implicit(dyn) if dyn_tok >= IMPLICIT_THRESHOLD else 0
+    chunks_file = Path("chunks.json")
+    queries_file = Path("queries.json")
 
-    # explicit core hits & cost
-    exp_hits = core_tokens
-    exp_cost = core_tokens * CACHE_DISCOUNT
+    with open(chunks_file, "r") as cf:
+        chunks_data = json.load(cf)
+    with open(queries_file, "r") as qf:
+        queries_data = json.load(qf)
 
-    # tokens actually sent
-    uncached_dyn = max(0, dyn_tok - imp_hits)
-    sent = uncached_dyn + q_tok
+    result = plan_batches(
+        chunk_texts_data=chunks_data,
+        query_map_data=queries_data,
+        max_batch_size=7,
+        implicit_threshold=2048,
+        cache_discount=0.25,
+        cache_ttl=3600,
+        registry_path="implicit_registry.pkl",
+        min_explicit_chunks=1,
+        max_explicit_chunks=50,
+        min_implicit_threshold=225,
+        max_implicit_threshold=4096,
+        min_cache_ttl=600,
+        max_cache_ttl=86400,
+        token_ratio=0.75,
+        log_level=logging.WARNING,
+    )
 
-    # charge generate: sent + explicit discount
-    total_opt += sent + exp_cost
-
-    plan.append({
-        "action":                "generate_content",
-        "group_id":              gid,
-        "batch_queries":         batch["queries"],
-        "core_explicit":         True,
-        "explicit_hits":         exp_hits,
-        "explicit_cost":         exp_cost,
-        "implicit_dynamic_hits": imp_hits,
-        "dynamic_tokens":        dyn_tok,
-        "uncached_dynamic":      uncached_dyn,
-        "query_tokens":          q_tok,
-        "sent_tokens":           sent
-    })
-
-# 3) Delete explicit cache at end
-if core_chunks:
-    plan.append({
-        "action":    "delete_explicit_cache",
-        "chunk_ids": sorted(core_chunks)
-    })
-
-# === PRINT INTERMEDIATE STEPS & SUMMARY ===
-print("✅ Simulation Plan:")
-for step in plan:
-    print(json.dumps(step, ensure_ascii=False))
-
-print("\n📊 Cost Summary:")
-print(f"  Raw tokens sent     : {total_raw}")
-print(f"  Optimized token cost: {total_opt}")
-print(f"  Savings             : {total_raw - total_opt} tokens ({(100*(total_raw-total_opt)/total_raw):.2f}%)")
+    print(json.dumps(result, indent=2))
