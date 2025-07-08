@@ -1,8 +1,8 @@
 import os
 import json
-import asyncio
 from pathlib import Path
 from dotenv import load_dotenv
+import asyncio
 
 import chromadb
 from chromadb.api.types import Documents, EmbeddingFunction
@@ -16,7 +16,8 @@ TOP_K_DEFAULT = 10
 DB_PATH = "./chroma_store"
 
 
-def _load_gemini_client_sync() -> genai.Client:
+def _load_gemini_client() -> genai.Client:
+    """Load environment and initialize Gemini client."""
     load_dotenv()
     return genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
@@ -59,34 +60,62 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
     ]
 
 
-async def load_gemini_client() -> genai.Client:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _load_gemini_client_sync)
-
-
-async def get_or_create_chroma_db(
-    client: genai.Client,
-    db_name: str,
-    embedding_fn: EmbeddingFunction,
-    clear: bool = False
-):
-    loop = asyncio.get_running_loop()
-    def _sync():
+async def _async_generate_chunk_and_query_mappings(
+    text_file: str,
+    queries_file: str,
+    output_chunk_json: str,
+    output_query_json: str,
+    chunk_size: int,
+    overlap: int,
+    top_k: int,
+    db_name: str
+) -> tuple[dict[str, str], dict[str, list[str]]]:
+    # 1. Init client & DB
+    client = await asyncio.get_running_loop().run_in_executor(None, _load_gemini_client)
+    ef = GeminiEmbeddingFunction(client=client, task_type="RETRIEVAL_DOCUMENT")
+    def _get_db():
         store = chromadb.PersistentClient(path=DB_PATH)
-        if clear:
-            try:
-                store.delete_collection(name=db_name)
-            except ValueError:
-                pass
-        return store.get_or_create_collection(
-            name=db_name,
-            embedding_function=embedding_fn
+        try:
+            store.delete_collection(name=db_name)
+        except ValueError:
+            pass
+        return store.get_or_create_collection(name=db_name, embedding_function=ef)
+    db = await asyncio.get_running_loop().run_in_executor(None, _get_db)
+
+    # 2. Read & chunk document
+    text = Path(text_file).read_text(encoding="utf-8")
+    chunks = chunk_text(text, chunk_size, overlap)
+    chunk_map = {f"chunk{str(i+1).zfill(3)}": c for i, c in enumerate(chunks)}
+
+    # 3. Add chunks to DB
+    await asyncio.get_running_loop().run_in_executor(
+        None,
+        lambda: db.add(ids=list(chunk_map.keys()), documents=list(chunk_map.values()))
+    )
+
+    # 4. Load queries
+    raw = json.loads(Path(queries_file).read_text(encoding="utf-8"))
+    queries = list(raw) if isinstance(raw, dict) else raw
+
+    # 5. Query top-k concurrently
+    async def fetch_ids(q: str):
+        res = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: db.query(query_texts=[q], n_results=top_k)
         )
-    return await loop.run_in_executor(None, _sync)
+        return q, res.get("ids", [[]])[0]
+
+    pairs = await asyncio.gather(*(fetch_ids(q) for q in queries))
+    query_map = dict(pairs)
+
+    # 6. Write outputs
+    Path(output_chunk_json).write_text(json.dumps(chunk_map, indent=2), encoding="utf-8")
+    Path(output_query_json).write_text(json.dumps(query_map, indent=2), encoding="utf-8")
+
+    return chunk_map, query_map
 
 
-async def generate_chunk_and_query_mappings(
-    *,
+def generate_chunk_and_query_mappings(
     text_file: str,
     queries_file: str,
     output_chunk_json: str = "chunks.json",
@@ -96,55 +125,26 @@ async def generate_chunk_and_query_mappings(
     top_k: int = TOP_K_DEFAULT,
     db_name: str = "document_db"
 ) -> tuple[dict[str, str], dict[str, list[str]]]:
-    # 1. Init client & DB
-    client = await load_gemini_client()
-    ef = GeminiEmbeddingFunction(client=client, task_type="RETRIEVAL_DOCUMENT")
-    db = await get_or_create_chroma_db(client, db_name, ef, clear=True)
-
-    # 2. Read & chunk document
-    text = Path(text_file).read_text(encoding="utf-8")
-    chunks = chunk_text(text, chunk_size, overlap)
-    chunk_map = {
-        f"chunk{str(i+1).zfill(3)}": chunk
-        for i, chunk in enumerate(chunks)
-    }
-
-    # 3. Add chunks to DB (sync)
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(
-        None,
-        lambda: db.add(ids=list(chunk_map.keys()),
-                        documents=list(chunk_map.values()))
-    )
-
-    # 4. Load queries
-    raw = json.loads(Path(queries_file).read_text(encoding="utf-8"))
-    queries = list(raw) if isinstance(raw, dict) else raw
-
-    # 5. Query top-k in parallel
-    async def fetch_ids(q: str) -> tuple[str, list[str]]:
-        res = await loop.run_in_executor(
-            None,
-            lambda: db.query(query_texts=[q], n_results=top_k)
+    """
+    Synchronous facade for async chunk/query mapper.
+    """
+    return asyncio.run(
+        _async_generate_chunk_and_query_mappings(
+            text_file,
+            queries_file,
+            output_chunk_json,
+            output_query_json,
+            chunk_size,
+            overlap,
+            top_k,
+            db_name
         )
-        return q, res.get("ids", [[]])[0]
-
-    tasks = [fetch_ids(q) for q in queries]
-    query_map = dict(await asyncio.gather(*tasks))
-
-    # 6. Write outputs
-    Path(output_chunk_json).write_text(
-        json.dumps(chunk_map, indent=2), encoding="utf-8"
-    )
-    Path(output_query_json).write_text(
-        json.dumps(query_map, indent=2), encoding="utf-8"
     )
 
-    return chunk_map, query_map
 
-
-async def main():
-    chunk_mapping, query_mapping = await generate_chunk_and_query_mappings(
+if __name__ == "__main__":
+    load_dotenv()
+    chunk_map, query_map = generate_chunk_and_query_mappings(
         text_file="example_document.txt",
         queries_file="example_queries.json",
         output_chunk_json="chunks.json",
@@ -152,10 +152,6 @@ async def main():
         chunk_size=200,
         overlap=40,
         top_k=10,
-        db_name="my_async_db"
+        db_name="my_sync_db"
     )
-    print(f"Generated {len(chunk_mapping)} chunks and mapped {len(query_mapping)} queries")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    print(f"Generated {len(chunk_map)} chunks and {len(query_map)} query mappings.")
