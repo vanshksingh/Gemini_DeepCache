@@ -178,12 +178,10 @@ The total savings in input cost come to about **61.6%** in this example.
 ### 📈 `Raw vs Optimized chart`
 
 A visual trend of **raw vs optimized** token usage over multiple runs. It compares:
+![final_token_savings_chart](https://github.com/user-attachments/assets/032df410-b319-458a-bb5c-3bfe069eeeb1)
 
 - Total raw vs optimized tokens
 - Input-side raw vs optimized tokens
-
-
-
 
 ---
 
