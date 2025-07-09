@@ -1,85 +1,247 @@
-# 🚀 Gemini DeepCache  
-**Efficient Batch Prediction with Long Context and Smart Caching**  
-*A Google Summer of Code 2025 project with Google DeepMind*
+# Gemini DeepCache
+
+🚀 GSoC 2025 Project with **Google DeepMind**  
+**Efficient Batch Prediction with Long Context and Smart Caching using Gemini API**
 
 ---
 
-## 📌 Overview
+## 📖 Overview
 
-**Gemini DeepCache** is an open-source code sample demonstrating advanced techniques for answering multiple queries over large content (e.g., video transcripts, documents) using **Google’s Gemini API** with long-context support.
+**Gemini DeepCache** is a modular, production-grade Python pipeline designed to efficiently answer large batches of queries over long documents (e.g. video transcripts, research papers) by:
 
-It focuses on reducing redundant computation and token usage by leveraging both **explicit and implicit context caching**, along with intelligent techniques like **chunk deduplication**, **query clustering**, and **cache-aware batching**.
+- Minimizing token usage via **context caching**
+- Supporting **long-context windows** (up to 32K tokens)
+- Performing **semantic batching** to reduce API calls
+- Utilizing **explicit and implicit cache mechanisms**
+- Persisting state and handling retries automatically
 
----
-
-## 🧠 Core Techniques
-
-### 🔁 Context De-Duplication
-Before sending context to Gemini, DeepCache identifies and removes overlapping or redundant chunks across multiple queries. This ensures the API processes each unique chunk only once — dramatically reducing token consumption in batched queries.
-
-### 🧩 Chunk Packing & Semantic Overlap
-Queries are semantically grouped, and their associated content is **merged into unified context windows** using vector-based similarity. This avoids repetition and maximizes cache hit potential across similar questions.
-
-### 📊 Cache-Aware Query Scheduling *(Planned)*
-Instead of sending queries in arbitrary order, DeepCache will include a scheduler that prioritizes queries based on **chunk reuse potential**, ensuring related queries are processed back-to-back to maximize Gemini’s caching effectiveness.
-
-### 🧭 Learned Query Routing *(Planned)*
-Prototype router to predict which cached context group a new query belongs to, using embedding similarity or few-shot classification. This enables dynamic reuse of earlier context blocks without recomputing embeddings.
-
-### ✂️ Retrieval-Masked Generation *(Exploration Phase)*
-Partial outputs will be reused where only a delta is needed — by masking overlapping context, the system avoids regenerating entire responses for slightly changed queries.
+This project demonstrates robust use of **Gemini 2.5 API** for scalable inference while saving cost and improving performance.
 
 ---
 
-## ⚙️ Gemini-Specific Optimizations
+## 🔧 Setup Instructions
 
-- ✅ **Explicit Caching API**: Utilizes `cache_id` and `cache_type` parameters for shared context blocks.
-- ✅ **Implicit Caching**: Automatically reuses identical tokens within session memory.
-- ✅ **Dynamic Chunk Splitting**: Long documents are split into meaning-preserving segments.
-- ✅ **Rate Limit Resilience**: Async-safe request handling (Streamlit-compatible strategies explored).
+### 1. Clone the Repo
 
----
+```bash
+git clone https://github.com/vanshksingh/Gemini_DeepCache.git
+cd Gemini_DeepCache
+```
 
-## 📈 Use Cases
+### 2. Create Virtual Environment
 
-- Question-answering over full-length **video lectures**, **meetings**, or **technical documents**
-- **Multi-query pipelines** where questions share overlapping background
-- Scenarios where **context length or API quota is a limiting factor**
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
 
----
+### 3. Install Dependencies
 
-## 🛠 Status
+```bash
+pip install -r requirements.txt
+```
 
-| Component                      | Status       |
-|-------------------------------|--------------|
-| Basic Chunking & Caching      | ✅ Complete   |
-| Streamlit UI (Async WIP)      | ⚙️ In Progress |
-| Query Scheduling Logic        | 🧠 Designing  |
-| Retrieval-Masked Gen Logic    | 🔍 Exploring  |
-| Learned Query Router          | 🧪 Researching|
+### 4. Get Your Gemini API Key
 
----
+Visit: 👉 https://aistudio.google.com/app/apikey
 
-## 🔗 Resources & References
+- Click **"Create API Key"**
+- Copy the key
 
-- [Gemini Caching Docs (Explicit & Implicit)](https://ai.google.dev/gemini-api/docs/caching?hl=en)
-- [Gemini Embeddings API](https://ai.google.dev/gemini-api/docs/embeddings)
-- [Google Dev Blog on Implicit Caching](https://developers.googleblog.com/en/gemini-2-5-models-now-support-implicit-caching/)
-- [Prompt Engineering Guide – Gemini Caching Notebook](https://github.com/dair-ai/Prompt-Engineering-Guide/blob/main/notebooks/gemini-context-caching.ipynb)
-- [Asyncio with Streamlit - Medium Guide](https://sehmi-conscious.medium.com/got-that-asyncio-feeling-f1a7c37cab8b)
+### 5. Configure `.env`
 
----
+Create a `.env` file in the root directory:
 
-## 🤝 Contributing & Contact
-
-This is an evolving project under Google Summer of Code 2025. Contributions, ideas, and suggestions are welcome!
-
-Author: [Vansh Kumar Singh](https://github.com/vanshksingh)  
-Project Mentor: Google DeepMind Team
+```env
+GEMINI_API_KEY=your_api_key_here
+```
 
 ---
 
-## 📜 License
+## 📦 Repository Structure
 
-MIT License — Open to all. Please cite if used in derivative work or demos.
+```bash
+Gemini_DeepCache/
+├── main.py               # Orchestrates the full pipeline
+├── gem_cache.py          # Cache-aware batch planning
+├── cache_utils.py        # Explicit cache creation, usage, deletion
+├── vectordb.py           # Chunk embedding and semantic mapping
+├── example_document.txt  # Sample document
+├── example_queries.json  # Sample questions
+├── requirements.txt      # Python dependencies
+├── README.md             # Documentation
+```
 
+---
+
+## 🧠 Core Components Explained
+
+### `main.py`
+
+The pipeline controller with the following **steps**:
+- `step_generate_chunks`: Chunk and embed input document
+- `step_create_plan`: Optimize batch planning based on token cost
+- `step_create_cache`: Upload cache blocks if explicit caching is possible
+- `step_execute_batches`: Generate answers with Gemini model, using cache where possible
+- `step_cleanup`: Delete explicit caches
+- `step_report`: Output token savings and performance stats
+
+Includes:
+- State saving and resuming (`pipeline_state.json`)
+- Retry logic on API/network failure (`with_retries`)
+
+---
+
+### `vectordb.py` – Semantic Chunking 🧩
+
+- Splits documents into overlapping chunks
+- Uses Gemini Embedding API to store and search with **ChromaDB**
+- Supports semantic query-to-chunk mapping
+
+---
+
+### `gem_cache.py` – Batch Planning Engine 🧠
+
+- Groups related queries together
+- Determines what can be cached explicitly vs implicitly
+- Plans token-efficient execution order
+- Outputs a **plan** with TTLs, cache thresholds, and reuse strategy
+
+---
+
+### `cache_utils.py` – Context Caching 💾
+
+- Create, manage, and delete **explicit cache blocks**
+- Uses `@use_cache {name}` instruction for guaranteed reuse
+- Helps achieve up to **75% per-token cost savings**
+
+---
+
+## 🔍 Example Usage
+
+### Input Files
+
+- `example_document.txt`: The long document (e.g. transcript)
+- `example_queries.json`: Array of queries:
+```json
+[
+  "What is context caching?",
+  "How does semantic clustering help efficiency?",
+  "Explain the role of Gemini embeddings."
+]
+```
+
+### Run the Pipeline
+
+```bash
+python main.py
+```
+
+---
+
+## 📏 Long Context Handling
+
+- Supports large contexts (e.g., 10K–32K tokens)
+- Chunked with overlap (`CHUNK_SIZE` and `OVERLAP` configurable)
+- Automatically skips explicit caching for chunks <4096 tokens (customizable)
+- Handles out-of-bound contexts by splitting into smaller pieces
+
+---
+
+## 📦 Batch Prediction Optimization
+
+- Batches are grouped to **maximize token reuse**
+- Each batch has its own `group_id` and reuses shared context
+- Automatically selects between **explicit cache**, **implicit cache**, or **raw prompt**
+- Configurable: `MAX_BATCH_SIZE`, `IMPLICIT_THRESHOLD`, `CACHE_TTL`, etc.
+
+---
+
+## 💾 Context Caching Logic
+
+| Type        | Benefit                          | Cost   |
+|-------------|----------------------------------|--------|
+| **Explicit**| Guaranteed reuse, up to 75% cost saved | Requires one-time upload |
+| **Implicit**| Reuse based on token overlap     | Less reliable, no guarantees |
+| **No Cache**| Always sends full context        | Full token cost |
+
+---
+
+## 🛡️ Error Handling
+
+All Gemini API calls are wrapped using:
+
+```python
+with_retries(fn, *args, **kwargs)
+```
+
+- Retries up to `RETRY_LIMIT` times
+- Waits `RETRY_DELAY` seconds between attempts
+- Logs and reports errors with context
+- Resumes from last successful pipeline step using saved state
+
+---
+
+## ✅ Expected Output
+
+- `answers_map.json`: Per-query results in JSON mode
+```json
+{
+  "What is context caching?": "Context caching is a technique where...",
+  ...
+}
+```
+
+- `answers.json`: Grouped answers in batch mode
+```json
+[
+  {"group_id": 1, "text": "..."},
+  {"group_id": 2, "text": "..."}
+]
+```
+
+- Console Report:
+```
+Planned raw=18300, opt=9400, saved=8900 (48.6%)
+Actual in=800, out=1600, total=2400
+```
+
+---
+
+## 🌐 GSoC Deliverable Targets
+
+| Feature                | ✅ Completed |
+|------------------------|-------------|
+| Detailed Code Comments | ✅ Yes |
+| Setup Instructions     | ✅ Yes |
+| Batch Optimization     | ✅ Yes |
+| Long Context Handling  | ✅ Yes |
+| Context Caching        | ✅ Yes |
+| Error Handling         | ✅ Yes |
+| Modular Functions      | ✅ Yes |
+
+
+---
+
+## 🧑‍💻 Contributing
+
+Want to build on top of DeepCache?
+
+1. Fork this repo
+2. Create a branch: `git checkout -b feature/xyz`
+3. Commit your changes with tests and docs
+4. Submit a Pull Request 🚀
+
+---
+
+## 📄 License
+
+MIT License © 2025 [Vansh Kumar Singh](https://github.com/vanshksingh)
+
+---
+
+## 🔗 Useful Links
+
+- [Gemini API Key](https://aistudio.google.com/app/apikey)
+- [Gemini API Docs](https://ai.google.dev/docs)
+- [Google DeepMind](https://deepmind.google/)
