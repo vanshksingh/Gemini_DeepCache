@@ -138,6 +138,62 @@ python main.py
 ```
 
 ---
+## 📊 Token Savings Report
+
+After running the pipeline, several artifacts are generated to help you audit and visualize cost efficiency and Gemini API usage.
+
+### ✅ `pipeline_state.json`
+
+Stores internal state and token metrics. Example:
+
+```json
+{
+  "plan": {
+    "summary": {
+      "total_raw_tokens": 70543,
+      "total_optimized_tokens": 27069.0,
+      "total_saved_tokens": 43474.0,
+      "saving_percentage": 61.6
+    }
+  },
+  "cache_name": "",
+  "input_tokens": 323,
+  "output_tokens": 10787
+}
+```
+The total savings in input cost come to about **61.6%** in this example.
+
+**Fields:**
+- `total_raw_tokens`: Estimated token usage without optimization  
+- `total_optimized_tokens`: Actual usage after batch planning and caching  
+- `saving_percentage`: Overall savings (%)  
+- `input_tokens`, `output_tokens`: Actual API usage stats for billing
+
+---
+
+### 📈 `Raw vs Optimized chart`
+
+A visual trend of **raw vs optimized** token usage over multiple runs. It compares:
+
+- Total raw vs optimized tokens
+- Input-side raw vs optimized tokens
+
+
+
+
+---
+
+### 📄 `token_savings_data.csv`
+
+CSV file used to generate the chart. Includes for each run:
+- `Run`
+- `Raw Total Tokens`
+- `Optimized Total Tokens`
+- `Input Raw Tokens`
+- `Optimized Input Tokens`
+
+
+---
 
 ## 📏 Long Context Handling
 
