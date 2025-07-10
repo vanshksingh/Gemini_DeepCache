@@ -53,7 +53,7 @@ def with_retries(fn, *args, **kwargs):
             return fn(*args, **kwargs)
         except Exception as e:
             last_exc = e
-            print(f"Attempt {{attempt}}/{{RETRY_LIMIT}} failed for {fn.__name__}: {e}")
+            print(f"Attempt {attempt}/{RETRY_LIMIT} failed for {fn.__name__}: {e}")
             if attempt < RETRY_LIMIT:
                 time.sleep(RETRY_DELAY)
     print(f"All {{RETRY_LIMIT}} retries failed for {fn.__name__}.")
