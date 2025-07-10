@@ -21,7 +21,7 @@ CHUNK_SIZE = 200
 OVERLAP = 40
 TOP_K = 10
 DB_NAME = "my_sync_db"
-MODEL = "gemini-2.5-flash"  # Use this model for both generate_content and cache
+MODEL = "gemini-2.0-flash"  # Use this model for both generate_content and cache
 MAX_BATCH_SIZE = 7
 IMPLICIT_THRESHOLD = 2048
 CACHE_DISCOUNT = 0.25
@@ -56,7 +56,7 @@ def with_retries(fn, *args, **kwargs):
             print(f"Attempt {attempt}/{RETRY_LIMIT} failed for {fn.__name__}: {e}")
             if attempt < RETRY_LIMIT:
                 time.sleep(RETRY_DELAY)
-    print(f"All {{RETRY_LIMIT}} retries failed for {fn.__name__}.")
+    print(f"All {RETRY_LIMIT} retries failed for {fn.__name__}.")
     raise last_exc
 
 
