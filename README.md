@@ -8,7 +8,8 @@
 **Efficient Batch Prediction with Long Context and Smart Caching using Gemini API**
 
 ---
-
+## ⚠️ Known API issue:
+In free tier of Gemini API Explicit cache is not functioning, it is being internally escalated for a fix at the moment.
 ---
 
 ## 📖 Overview
