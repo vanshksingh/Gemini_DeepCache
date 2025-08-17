@@ -3,6 +3,8 @@ import json
 import logging
 import time
 from pathlib import Path
+from datetime import datetime, timezone
+
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -41,6 +43,7 @@ DISPLAY_CACHE_NAME = "gsoc_gemini_deepcache"
 STATE_FILE = "pipeline_state.json"
 ANSWERS_FILE = "answers.json"
 ANSWERS_MAP_FILE = "answers_map.json"
+FINAL_TEXT_FILE = "final_output.txt"   # <— NEW
 
 # When True, delete state and answers files after completion
 delete_state_on_exit = False
@@ -118,7 +121,7 @@ def save_state(state: dict):
 
 
 def cleanup_files():
-    for fn in (STATE_FILE, ANSWERS_FILE, ANSWERS_MAP_FILE):
+    for fn in (STATE_FILE, ANSWERS_FILE, ANSWERS_MAP_FILE, FINAL_TEXT_FILE):
         if Path(fn).exists():
             os.remove(fn)
             print(f"Deleted {fn}")
@@ -146,7 +149,6 @@ def step_generate_chunks(state: dict):
 
 def step_create_plan(state: dict):
     print('[Step] Creating plan...')
-    # plan_batches takes chunk_map and query_map and keyword args
     state['plan'] = with_retries(
         lambda: plan_batches(
             state['chunk_map'],
@@ -203,11 +205,11 @@ def step_create_cache(state: dict, client):
 
 def step_execute_batches(state: dict, client):
     print('[Step] Executing queries...')
-    mapping = {}
     tin, tout = 0, 0
     cache_name = state.get('cache_name') or None
 
     if JSON_MODE:
+        mapping = {}
         for batch in state['plan'].get('batches', []):
             for q in batch.get('batch_queries', []):
                 def _call():
@@ -217,17 +219,14 @@ def step_execute_batches(state: dict, client):
                         prompt=q,
                         cached_content_name=cache_name
                     )
-
                 try:
                     resp = with_retries(_call)
-                    # SDK versions vary in usage_metadata; be defensive:
                     if getattr(resp, "usage_metadata", None):
                         tin  += getattr(resp.usage_metadata, "prompt_token_count", 0) or 0
                         tout += getattr(resp.usage_metadata, "candidates_token_count", 0) or 0
                         total = getattr(resp.usage_metadata, "total_token_count", None)
                     else:
                         total = None
-
                     mapping[q] = resp.text
                     if total is not None:
                         print(f"Answered '{q[:30]}...': {total} tokens")
@@ -237,11 +236,13 @@ def step_execute_batches(state: dict, client):
                     print(f"[!] Query failed after retries: {e}")
                     break
 
+        # Persist answers and also keep in state for final text generation
         Path(ANSWERS_MAP_FILE).write_text(json.dumps(mapping, indent=2))
+        state['answers_mode'] = 'map'
+        state['answers_map'] = mapping
 
     else:
-        # If you want “true” batching, you can also send multiple Content messages.
-        # Here we combine queries into one prompt for simplicity.
+        # Grouped mode
         results = []
         for batch in state['plan'].get('batches', []):
             texts = batch.get('batch_queries', [])
@@ -275,7 +276,10 @@ def step_execute_batches(state: dict, client):
                 print(f"[!] Batch failed after retries: {e}")
                 break
 
+        # Persist answers and also keep in state for final text generation
         Path(ANSWERS_FILE).write_text(json.dumps(results, indent=2))
+        state['answers_mode'] = 'batches'
+        state['answers_batches'] = results
 
     state.update({'input_tokens': tin, 'output_tokens': tout})
     state['step'] = 'batches_executed'
@@ -305,7 +309,140 @@ def step_report(state: dict):
     out_tok = state.get('output_tokens', 0)
     print(f"Actual in={in_tok}, out={out_tok}, total={in_tok + out_tok}")
 
+    # Persist a JSON report alongside the text one (optional, handy for tooling)
+    report_json = {
+        "planned_raw": raw,
+        "planned_opt": opt,
+        "planned_saved": saved,
+        "saving_percentage": s['saving_percentage'],
+        "actual_input_tokens": in_tok,
+        "actual_output_tokens": out_tok,
+        "actual_total_tokens": in_tok + out_tok
+    }
+    Path("report.json").write_text(json.dumps(report_json, indent=2))
+
+    # Store for final text file generation
+    state['report'] = report_json
     state['step'] = 'report_done'
+    save_state(state)
+
+
+# === NEW: Final text writer ===
+def _format_header(title: str, ch: str = "=") -> str:
+    return f"{title}\n{ch * len(title)}"
+
+
+def _load_answers_from_disk_if_missing(state: dict):
+    """
+    If answers are not in memory (state), try to read from disk to make the
+    final text robust even across runs.
+    """
+    if 'answers_mode' in state:
+        return
+
+    if Path(ANSWERS_MAP_FILE).exists():
+        try:
+            mapping = json.loads(Path(ANSWERS_MAP_FILE).read_text())
+            state['answers_mode'] = 'map'
+            state['answers_map'] = mapping
+            return
+        except Exception:
+            pass
+
+    if Path(ANSWERS_FILE).exists():
+        try:
+            batches = json.loads(Path(ANSWERS_FILE).read_text())
+            state['answers_mode'] = 'batches'
+            state['answers_batches'] = batches
+            return
+        except Exception:
+            pass
+
+    # Fallback if nothing is found
+    state['answers_mode'] = 'none'
+
+
+def _build_answers_text(state: dict) -> str:
+    mode = state.get('answers_mode', 'none')
+    lines = []
+    if mode == 'map':
+        mapping = state.get('answers_map', {})
+        if not mapping:
+            return "No answers captured.\n"
+        lines.append(_format_header("Answers"))
+        for i, (q, a) in enumerate(mapping.items(), start=1):
+            lines.append(f"\nQ{i}. {q}\nA{i}. {a}\n")
+        return "\n".join(lines) + "\n"
+    elif mode == 'batches':
+        batches = state.get('answers_batches', [])
+        if not batches:
+            return "No answers captured.\n"
+        lines.append(_format_header("Answers by Batch"))
+        for b in batches:
+            gid = b.get('group_id', 'unknown')
+            text = b.get('text', '')
+            lines.append(f"\n[Group: {gid}]\n{text}\n")
+        return "\n".join(lines) + "\n"
+    else:
+        return "No answers captured.\n"
+
+
+def _build_report_text(state: dict) -> str:
+    rpt = state.get('report', {})
+    if not rpt:
+        return "Report data not available.\n"
+
+    lines = [
+        _format_header("Report Summary"),
+        f"Planned raw tokens     : {rpt.get('planned_raw', 'N/A')}",
+        f"Planned optimized tokens: {rpt.get('planned_opt', 'N/A')}",
+        f"Planned saved tokens    : {rpt.get('planned_saved', 'N/A')}",
+        f"Savings percentage      : {rpt.get('saving_percentage', 'N/A')}",
+        "",
+        f"Actual input tokens     : {rpt.get('actual_input_tokens', 'N/A')}",
+        f"Actual output tokens    : {rpt.get('actual_output_tokens', 'N/A')}",
+        f"Actual total tokens     : {rpt.get('actual_total_tokens', 'N/A')}",
+        ""
+    ]
+    return "\n".join(lines)
+
+
+def step_write_final_text(state: dict):
+    """
+    Build a single human-friendly text file that includes:
+      - Run metadata (timestamp, model, cache info)
+      - Report summary
+      - Answers (per-query or per-batch)
+    """
+    print('[Step] Writing final text output...')
+    _load_answers_from_disk_if_missing(state)
+
+    timestamp = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    cache_name = state.get('cache_name', '')
+    plan = state.get('plan', {})
+    plan_summary = plan.get('summary', {}) if isinstance(plan, dict) else {}
+    planned_groups = plan_summary.get('groups', 'N/A')
+
+    header = [
+        _format_header("Gemini Pipeline Run"),
+        f"Timestamp  : {timestamp}",
+        f"Model      : {MODEL}",
+        f"Cache Used : {bool(cache_name)}",
+        f"Cache Name : {cache_name or 'N/A'}",
+        f"JSON_MODE  : {JSON_MODE}",
+        f"Planned Groups: {planned_groups}",
+        ""
+    ]
+
+    report_text = _build_report_text(state)
+    answers_text = _build_answers_text(state)
+
+    body = "\n".join(header) + report_text + "\n" + answers_text
+
+    Path(FINAL_TEXT_FILE).write_text(body, encoding="utf-8")
+    print(f"Final text written to: {FINAL_TEXT_FILE}")
+
+    state['step'] = 'final_written'
     save_state(state)
 
 
@@ -331,6 +468,10 @@ if __name__ == '__main__':
 
         if state.get('step') == 'cleanup_done':
             step_report(state)
+
+        # NEW: write a single consolidated text artifact
+        if state.get('step') == 'report_done':
+            step_write_final_text(state)
 
     except Exception as e:
         print(f"[!] Pipeline error: {e}")

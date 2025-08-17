@@ -1,0 +1,156 @@
+Gemini Pipeline Run
+===================
+Timestamp  : 2025-08-17T05:35:06+05:30
+Model      : models/gemini-2.0-flash-001
+Cache Used : True
+Cache Name : cachedContents/ld2cccgr7wy67xucbhvmdhl1ljainxasma984fzp
+JSON_MODE  : True
+Planned Groups: N/A
+Report Summary
+==============
+Planned raw tokens     : 70543
+Planned optimized tokens: 27069.0
+Planned saved tokens    : 43474.0
+Savings percentage      : 61.6
+
+Actual input tokens     : 176073
+Actual output tokens    : 1116
+Actual total tokens     : 177189
+
+Answers
+=======
+
+Q1. What is Wikipedia and what is its primary purpose?
+A1. Wikipedia is a free online encyclopedia written and maintained by a community of volunteers through open collaboration. Its primary purpose is to create and distribute a free encyclopedia of the highest possible quality to every single person on the planet in their own language.
+
+
+
+Q2. Who founded Wikipedia and when was it launched?
+A2. According to the article, Wikipedia was founded by Jimmy Wales and Larry Sanger in 2001. It was launched on January 15, 2001.
+
+
+
+Q3. How many languages is Wikipedia available in as of July 8, 2025?
+A3. The article states that Wikipedia is available in 342 languages as of July 2025.
+
+
+
+Q4. Where are Wikipedia’s headquarters located?
+A4. According to the article, Wikipedia's headquarters are located in San Francisco, California, U.S.
+
+
+
+Q5. Which organization owns and operates Wikipedia?
+A5. According to the article, Wikipedia has been hosted since 2003 by the Wikimedia Foundation, an American nonprofit organization funded mainly by donations from readers.
+
+
+
+Q6. Under which license is most Wikipedia content released?
+A6. According to the provided text, most text on Wikipedia is licensed under CC Attribution / Share-Alike 4.0 and also dual-licensed under GFDL; media licensing varies.
+
+
+
+Q7. What software platform does Wikipedia run on?
+A7. According to the article, Wikipedia uses the wiki software **MediaWiki**.
+
+
+
+Q8. How many articles does the English Wikipedia contain?
+A8. As of July 9, 2025, the English Wikipedia has 7,020,564 articles.
+
+
+
+Q9. How many total articles exist across all language editions?
+A9. As of July 9, 2025, there are 65,179,462 articles across all language editions of Wikipedia.
+
+
+
+Q10. What was Nupedia and how is it related to Wikipedia?
+A10. According to the article, Nupedia was a free online English-language encyclopedia project whose articles were written by experts and reviewed under a formal process. Wikipedia began as a complementary project for Nupedia. Nupedia and Wikipedia coexisted until the former's servers were taken down permanently in 2003, and its text was incorporated into Wikipedia.
+
+
+
+Q11. When did Wikipedia switch its domain from wikipedia.com to wikipedia.org?
+A11. According to the article, Wales announced that Wikipedia would not display advertisements, and changed Wikipedia's domain from wikipedia.com to wikipedia.org in February 2002.
+
+
+
+Q12. How is Wikipedia funded and sustained financially?
+A12. According to the article, Wikipedia has been hosted since 2003 by the Wikimedia Foundation, an American nonprofit organization funded mainly by donations from readers.
+
+
+
+Q13. What are some key milestones in Wikipedia’s growth history?
+A13. Here are some key milestones in Wikipedia's growth history, according to the provided text:
+
+*   **2001:** Wikipedia was founded by Jimmy Wales and Larry Sanger as a complementary project for Nupedia. Language editions began to be created in March.
+*   **2003:** Nupedia's servers were taken down permanently, and its text was incorporated into Wikipedia.
+*   **End of 2004:** A total of 161 language editions were in use.
+*   **September 9, 2007:** The English Wikipedia passed the mark of 2 million articles, becoming the largest encyclopedia ever assembled.
+*   **August 2009:** The English Wikipedia reached 3 million articles.
+*   **June 2019:** Scientists reported that all 16 GB of article text from the English Wikipedia had been encoded into synthetic DNA.
+*   **July 9, 2025:** Wikipedia has 65,179,462 articles in 342 languages. The English Wikipedia has 7,020,564 articles.
+
+
+Q14. Which countries account for the largest share of Wikipedia’s traffic?
+A14. According to the article, as of May 2025, over 25% of Wikipedia's traffic comes from the United States, while Japan, the United Kingdom, Germany and Russia each account for around 5%.
+
+
+
+Q15. How did Wikipedia first gain contributors in its early days?
+A15. According to the text, Wikipedia gained early contributors from:
+
+*   Nupedia
+*   Slashdot postings
+*   Web search engine indexing
+
+
+Q16. What is the relationship between Wikipedia and the GNU FDL?
+A16. According to the article, Nupedia switched to the GNU Free Documentation License (GFDL) before Wikipedia was founded. Also, the article states that most text is also dual-licensed under GFDL.
+
+
+
+Q17. When did Wikipedia surpass the Yongle Encyclopedia in article count?
+A17. According to the article, the English Wikipedia passed the mark of 2 million articles on September 9, 2007, making it the largest encyclopedia ever assembled, surpassing the Yongle Encyclopedia.
+
+
+
+Q18. What is systemic bias on Wikipedia and what forms does it take?
+A18. According to the article, Wikipedia has been criticized for systemic bias, such as a gender bias against women and a geographical bias against the Global South.
+
+
+
+Q19. What does the 'neutral point-of-view' policy entail?
+A19. According to the article, the 'neutral point of view' policy is one of the "Five pillars" of Wikipedia. The article states that Wikipedia is written from a neutral point of view and must not take sides.
+
+
+
+Q20. What criticisms has Wikipedia faced regarding bias?
+A20. Wikipedia has been criticized for systemic bias, such as a gender bias against women and a geographical bias against the Global South.
+
+
+
+Q21. How did Wikipedia’s editor count change between 2008 and 2009?
+A21. According to the article, in November 2009, a researcher at the Rey Juan Carlos University in Madrid, Spain found that the English Wikipedia had lost 49,000 editors during the first three months of 2009; in comparison, it lost only 4,900 editors during the same period in 2008.
+
+
+
+Q22. What was the significance of the 2012 SOPA/PIPA blackout?
+A22. I'm sorry, but the provided text does not contain any information regarding the 2012 SOPA/PIPA blackout.
+
+
+
+Q23. How many active device visits does Wikipedia attract per month?
+A23. As of April 2024, Wikipedia attracts more than 1.5 billion unique device visits per month.
+
+
+
+Q24. What happened with the Vector 2022 site redesign?
+A24. I'm sorry, but the provided text does not contain any information about the Vector 2022 site redesign.
+
+
+
+Q25. How many Wikipedia editions existed by the end of 2004?
+A25. According to the article, there were a total of 161 language editions of Wikipedia in use by the end of 2004.
+
+
