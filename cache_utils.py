@@ -2,8 +2,7 @@ import os
 import time
 import pathlib
 import datetime
-import requests
-from typing import Union, List, Any
+from typing import Union, List, Any, Optional
 
 from dotenv import load_dotenv
 from google import genai
@@ -17,34 +16,22 @@ def load_gemini_client() -> genai.Client:
     Requires GEMINI_API_KEY in .env
     """
     load_dotenv()
-    return genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("Missing GEMINI_API_KEY in .env")
+    return genai.Client(api_key=api_key)
 
 
 # === FILE UTILITIES ===
-def download_file(url: str, dest_path: Union[str, pathlib.Path]) -> pathlib.Path:
-    """
-    Download a file from `url` to `dest_path` if it does not already exist.
-    Returns the Path to the downloaded file.
-    """
-    path = pathlib.Path(dest_path)
-    if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open('wb') as wf:
-            response = requests.get(url, stream=True)
-            response.raise_for_status()
-            for chunk in response.iter_content(chunk_size=32768):
-                wf.write(chunk)
-    return path
-
-
 def upload_file(client: genai.Client, path: Union[str, pathlib.Path]) -> Any:
     """
-    Upload a file to Gemini Files API and wait until processing is complete.
+    Upload a file to the Gemini Files API and wait until processing is complete.
     Returns the uploaded file resource.
     """
-    file_obj = client.files.upload(file=pathlib.Path(path))
+    path = pathlib.Path(path)
+    file_obj = client.files.upload(file=path)
     while file_obj.state.name == 'PROCESSING':
-        print('Waiting for file to be processed...')
+        # Avoid tight spin loops
         time.sleep(2)
         file_obj = client.files.get(name=file_obj.name)
     return file_obj
@@ -54,14 +41,28 @@ def upload_file(client: genai.Client, path: Union[str, pathlib.Path]) -> Any:
 def create_explicit_cache(
     client: genai.Client,
     model: str,
-    contents: List[Any],
+    contents: List[types.Content],
     system_instruction: str,
     ttl_seconds: int = 360,
     display_name: str = "cache"
 ) -> Any:
     """
-    Create an explicit cache for `model` with given contents and system instruction.
-    TTL is in seconds. Returns the cache resource.
+    Create an explicit cache for `model`.
+
+    Parameters
+    ----------
+    client : genai.Client
+    model : str
+        Fully-qualified model id, e.g. "models/gemini-2.0-flash-001"
+    contents : List[types.Content]
+        Pre-constructed messages with roles. Typically role="user".
+    system_instruction : str
+    ttl_seconds : int
+    display_name : str
+
+    Returns
+    -------
+    Cache resource (cachedContents/...)
     """
     cache = client.caches.create(
         model=model,
@@ -82,35 +83,28 @@ def generate_from_cache(
     prompt: str
 ) -> Any:
     """
-    Use an existing cache to generate content with `prompt`.
-    Returns the generation response.
+    Use an existing explicit cache to generate content with `prompt`.
+    Ensures valid roles and passes cached_content via GenerateContentConfig.
     """
-    response = client.models.generate_content(
+    return client.models.generate_content(
         model=model,
-        contents=prompt,
+        contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
         config=types.GenerateContentConfig(cached_content=cache_name)
     )
-    return response
 
 
 def list_caches(client: genai.Client) -> List[Any]:
-    """
-    List metadata for all caches.
-    """
+    """List metadata for all caches."""
     return list(client.caches.list())
 
 
 def get_cache_metadata(client: genai.Client, name: str) -> Any:
-    """
-    Retrieve metadata for a single cache by `name`.
-    """
+    """Retrieve metadata for a single cache by `name`."""
     return client.caches.get(name=name)
 
 
 def update_cache_ttl(client: genai.Client, name: str, ttl_seconds: int) -> Any:
-    """
-    Update the TTL for cache `name` to `ttl_seconds`.
-    """
+    """Update the TTL for cache `name` to `ttl_seconds`."""
     return client.caches.update(
         name=name,
         config=types.UpdateCachedContentConfig(ttl=f"{ttl_seconds}s")
@@ -125,6 +119,8 @@ def update_cache_expiry_time(
     """
     Update the expire_time for cache `name` to a timezone-aware datetime.
     """
+    if expire_time.tzinfo is None or expire_time.tzinfo.utcoffset(expire_time) is None:
+        raise ValueError("expire_time must be timezone-aware (e.g., UTC).")
     return client.caches.update(
         name=name,
         config=types.UpdateCachedContentConfig(expire_time=expire_time)
@@ -132,104 +128,55 @@ def update_cache_expiry_time(
 
 
 def delete_cache(client: genai.Client, name: str) -> None:
-    """
-    Delete cache with `name`.
-    """
+    """Delete cache with `name`."""
     client.caches.delete(name=name)
 
 
 # === FILE METADATA UTILITIES ===
 def list_files(client: genai.Client) -> List[Any]:
-    """
-    List all uploaded files.
-    """
+    """List all uploaded files."""
     return list(client.files.list())
 
 
 def get_file_metadata(client: genai.Client, file_name: str) -> Any:
-    """
-    Get metadata for a single uploaded file by `file_name`.
-    """
+    """Get metadata for a single uploaded file by `file_name`."""
     return client.files.get(name=file_name)
 
 
 def delete_file(client: genai.Client, file_name: str) -> None:
-    """
-    Delete an uploaded file by `file_name`.
-    """
+    """Delete an uploaded file by `file_name`."""
     client.files.delete(name=file_name)
 
 
-# === USAGE EXAMPLE ===
+# === Optional local demo (kept minimal and non-network-heavy by default) ===
 if __name__ == "__main__":
-    # Initialize client
-    client = load_gemini_client()
-    model_id = "models/gemini-2.0-flash-001"
-
-    # --- FILE UPLOAD EXAMPLE ---
-    video_url = (
-        "https://storage.googleapis.com/generativeai-downloads/data/SherlockJr._10min.mp4"
-    )
-    video_path = download_file(video_url, "./SherlockJr._10min.mp4")
-    uploaded_video = upload_file(client, video_path)
-    print("Uploaded file URI:", uploaded_video.uri)
-
-    # --- EXPLICIT CACHE EXAMPLE ---
-    cache = create_explicit_cache(
-        client=client,
-        model=model_id,
-        contents=[uploaded_video],
-        system_instruction=(
-            "You are an expert video analyzer. Answer queries based on the video file."
-        ),
-        ttl_seconds=300,
-        display_name="sherlock_jr_cache"
-    )
-    print("Cache created:", cache.name)
-
-    # Generate with cache
-    prompt_text = (
-        "List characters introduced in the movie with descriptions and timestamps."
-    )
-    response = generate_from_cache(
-        client=client,
-        model=model_id,
-        cache_name=cache.name,
-        prompt=prompt_text
-    )
-    print("Usage metadata:", response.usage_metadata)
-    print("Response text:\n", response.text)
-
-    # --- CACHE LISTING EXAMPLE ---
-    all_caches = list_caches(client)
-    for c in all_caches:
-        print(c.name, c.create_time, c.expire_time)
-
-    # --- CACHE METADATA EXAMPLE ---
-    meta = get_cache_metadata(client, cache.name)
-    print("Cache metadata:", meta)
-
-    # --- CACHE UPDATE EXAMPLES ---
-    update_cache_ttl(client, cache.name, ttl_seconds=600)
-    print("Updated TTL to 600s")
-
-    new_expiry = datetime.datetime.now(
-        datetime.timezone.utc
-    ) + datetime.timedelta(minutes=10)
-    update_cache_expiry_time(client, cache.name, new_expiry)
-    print("Updated expiry time to", new_expiry.isoformat())
-
-    # --- CACHE DELETE EXAMPLE ---
-    delete_cache(client, cache.name)
-    print("Deleted cache", cache.name)
-
-    # --- FILE METADATA EXAMPLES ---
-    files = list_files(client)
-    for f in files:
-        print(f.name, f.create_time)
-
-    file_meta = get_file_metadata(client, uploaded_video.name)
-    print("File metadata:", file_meta)
-
-    delete_file(client, uploaded_video.name)
-    print("Deleted file", uploaded_video.name)
+    # Example scaffold (commented to avoid accidental network calls)
+    # client = load_gemini_client()
+    # model_id = "models/gemini-2.0-flash-001"
+    #
+    # # Example: create a tiny text cache from a couple of user messages
+    # contents = [
+    #     types.Content(role="user", parts=[types.Part(text="Project context: ACME RAG system design.")]),
+    #     types.Content(role="user", parts=[types.Part(text="Key terms: chunking, hybrid search, cache TTL.")]),
+    # ]
+    # cache = create_explicit_cache(
+    #     client=client,
+    #     model=model_id,
+    #     contents=contents,
+    #     system_instruction="Answer concisely using the cached context.",
+    #     ttl_seconds=300,
+    #     display_name="tiny_demo_cache"
+    # )
+    # print("Cache created:", cache.name)
+    #
+    # resp = generate_from_cache(
+    #     client=client,
+    #     model=model_id,
+    #     cache_name=cache.name,
+    #     prompt="What are the key terms and why do they matter?"
+    # )
+    # print(resp.text)
+    #
+    # delete_cache(client, cache.name)
+    # print("Deleted cache.")
+    pass

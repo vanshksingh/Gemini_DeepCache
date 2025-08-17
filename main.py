@@ -6,13 +6,15 @@ from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+
 from cache_utils import (
     create_explicit_cache,
-    generate_from_cache,
+    generate_from_cache,   # kept for completeness; not used directly in this file
     delete_cache
 )
 from vectordb import generate_chunk_and_query_mappings
 from gem_cache import plan_batches
+
 
 # === Configuration ===
 TEXT_FILE = "example_document.txt"
@@ -21,7 +23,8 @@ CHUNK_SIZE = 200
 OVERLAP = 40
 TOP_K = 10
 DB_NAME = "my_sync_db"
-MODEL = "gemini-2.0-flash"  # Use this model for both generate_content and cache
+# Prefer fully qualified model id
+MODEL = "models/gemini-2.0-flash-001"  # works for both generate_content and caches
 MAX_BATCH_SIZE = 7
 IMPLICIT_THRESHOLD = 2048
 CACHE_DISCOUNT = 0.25
@@ -38,14 +41,18 @@ DISPLAY_CACHE_NAME = "gsoc_gemini_deepcache"
 STATE_FILE = "pipeline_state.json"
 ANSWERS_FILE = "answers.json"
 ANSWERS_MAP_FILE = "answers_map.json"
+
 # When True, delete state and answers files after completion
 delete_state_on_exit = False
+
 # If True, map each query individually to its answer
 JSON_MODE = True
+
 RETRY_LIMIT = 5
 RETRY_DELAY = 2  # seconds between retries
 
 
+# === Helpers ===
 def with_retries(fn, *args, **kwargs):
     last_exc = None
     for attempt in range(1, RETRY_LIMIT + 1):
@@ -58,6 +65,30 @@ def with_retries(fn, *args, **kwargs):
                 time.sleep(RETRY_DELAY)
     print(f"All {RETRY_LIMIT} retries failed for {fn.__name__}.")
     raise last_exc
+
+
+def to_user_content(text: str) -> types.Content:
+    """Wrap plain text into a valid user message for the GenAI SDK."""
+    return types.Content(role="user", parts=[types.Part(text=text)])
+
+
+def call_model(
+    client: genai.Client,
+    model: str,
+    prompt: str,
+    cached_content_name: str | None = None
+):
+    """
+    Generate with optional explicit cache handle.
+    Ensures valid roles and correct explicit-cache wiring.
+    """
+    kwargs = {
+        "model": model,
+        "contents": [to_user_content(prompt)]
+    }
+    if cached_content_name:
+        kwargs["config"] = types.GenerateContentConfig(cached_content=cached_content_name)
+    return client.models.generate_content(**kwargs)
 
 
 def init_client():
@@ -93,6 +124,7 @@ def cleanup_files():
             print(f"Deleted {fn}")
 
 
+# === Steps ===
 def step_generate_chunks(state: dict):
     print('[Step] Generating chunks & queries...')
     chunk_map, query_map = with_retries(
@@ -145,7 +177,9 @@ def step_create_cache(state: dict, client):
     ctx = cache_plan.get('ctx_tokens', 0)
     state['cache_name'] = ''
     if ctx >= 4096:
-        contents = [state['chunk_map'][cid] for cid in cache_plan.get('chunk_ids', [])]
+        # Wrap each chunk as a proper user message
+        chunk_ids = cache_plan.get('chunk_ids', [])
+        contents = [to_user_content(state['chunk_map'][cid]) for cid in chunk_ids]
         try:
             cache = with_retries(
                 lambda: create_explicit_cache(
@@ -162,7 +196,7 @@ def step_create_cache(state: dict, client):
         except Exception as e:
             print(f"[!] Cache creation failed after retries: {e}")
     else:
-        print(f"Skipping cache: ctx={{ctx}} <4096 tokens")
+        print(f"Skipping cache: ctx={ctx} < 4096 tokens")
     state['step'] = 'cache_created'
     save_state(state)
 
@@ -171,42 +205,78 @@ def step_execute_batches(state: dict, client):
     print('[Step] Executing queries...')
     mapping = {}
     tin, tout = 0, 0
+    cache_name = state.get('cache_name') or None
+
     if JSON_MODE:
         for batch in state['plan'].get('batches', []):
             for q in batch.get('batch_queries', []):
-                def call_query():
-                    contents = []
-                    if state['cache_name']:
-                        contents.append(types.Content(parts=[types.Part(text=f"@use_cache {state['cache_name']}")]))
-                    return client.models.generate_content(model=MODEL, contents=contents + [q])
+                def _call():
+                    return call_model(
+                        client=client,
+                        model=MODEL,
+                        prompt=q,
+                        cached_content_name=cache_name
+                    )
+
                 try:
-                    resp = with_retries(call_query)
-                    tin += resp.usage_metadata.prompt_token_count
-                    tout += resp.usage_metadata.candidates_token_count
+                    resp = with_retries(_call)
+                    # SDK versions vary in usage_metadata; be defensive:
+                    if getattr(resp, "usage_metadata", None):
+                        tin  += getattr(resp.usage_metadata, "prompt_token_count", 0) or 0
+                        tout += getattr(resp.usage_metadata, "candidates_token_count", 0) or 0
+                        total = getattr(resp.usage_metadata, "total_token_count", None)
+                    else:
+                        total = None
+
                     mapping[q] = resp.text
-                    print(f"Answered '{q[:30]}...': {resp.usage_metadata.total_token_count} tokens")
+                    if total is not None:
+                        print(f"Answered '{q[:30]}...': {total} tokens")
+                    else:
+                        print(f"Answered '{q[:30]}...'")
                 except Exception as e:
                     print(f"[!] Query failed after retries: {e}")
                     break
+
         Path(ANSWERS_MAP_FILE).write_text(json.dumps(mapping, indent=2))
+
     else:
+        # If you want “true” batching, you can also send multiple Content messages.
+        # Here we combine queries into one prompt for simplicity.
         results = []
         for batch in state['plan'].get('batches', []):
-            def call_batch():
-                contents = []
-                if state['cache_name']:
-                    contents.append(types.Content(parts=[types.Part(text=f"@use_cache {state['cache_name']}")]))
-                return client.models.generate_content(model=MODEL, contents=contents + batch.get('batch_queries', []))
+            texts = batch.get('batch_queries', [])
+            combined_prompt = "Answer each question separately:\n\n" + "\n\n".join(
+                f"Q{i+1}. {t}" for i, t in enumerate(texts)
+            )
+
+            def _call():
+                return call_model(
+                    client=client,
+                    model=MODEL,
+                    prompt=combined_prompt,
+                    cached_content_name=cache_name
+                )
+
             try:
-                resp = with_retries(call_batch)
-                tin += resp.usage_metadata.prompt_token_count
-                tout += resp.usage_metadata.candidates_token_count
+                resp = with_retries(_call)
+                if getattr(resp, "usage_metadata", None):
+                    tin  += getattr(resp.usage_metadata, "prompt_token_count", 0) or 0
+                    tout += getattr(resp.usage_metadata, "candidates_token_count", 0) or 0
+                    total = getattr(resp.usage_metadata, "total_token_count", None)
+                else:
+                    total = None
+
                 results.append({'group_id': batch['group_id'], 'text': resp.text})
-                print(f"Batch {batch['group_id']}: {resp.usage_metadata.total_token_count} tokens")
+                if total is not None:
+                    print(f"Batch {batch['group_id']}: {total} tokens")
+                else:
+                    print(f"Batch {batch['group_id']}: done")
             except Exception as e:
                 print(f"[!] Batch failed after retries: {e}")
                 break
+
         Path(ANSWERS_FILE).write_text(json.dumps(results, indent=2))
+
     state.update({'input_tokens': tin, 'output_tokens': tout})
     state['step'] = 'batches_executed'
     save_state(state)
@@ -214,7 +284,7 @@ def step_execute_batches(state: dict, client):
 
 def step_cleanup(state: dict, client):
     print('[Step] Cleaning up...')
-    if state['cache_name']:
+    if state.get('cache_name'):
         try:
             with_retries(lambda: delete_cache(client, state['cache_name']))
             print(f"Deleted cache {state['cache_name']}")
@@ -228,26 +298,44 @@ def step_report(state: dict):
     print('[Step] Report:')
     s = state['plan']['summary']
     raw, opt = s['total_raw_tokens'], s['total_optimized_tokens']
-    print(f"Planned raw={raw}, opt={opt}, saved={raw-opt} ({s['saving_percentage']}%)")
-    print(f"Actual in={state['input_tokens']}, out={state['output_tokens']}, total={state['input_tokens']+state['output_tokens']}")
+    saved = raw - opt
+    print(f"Planned raw={raw}, opt={opt}, saved={saved} ({s['saving_percentage']}%)")
+
+    in_tok = state.get('input_tokens', 0)
+    out_tok = state.get('output_tokens', 0)
+    print(f"Actual in={in_tok}, out={out_tok}, total={in_tok + out_tok}")
+
     state['step'] = 'report_done'
     save_state(state)
+
 
 if __name__ == '__main__':
     logging.basicConfig(level=LOG_LEVEL)
     client = init_client()
     state = load_state()
     try:
-        if state.get('step') != 'chunks_generated': step_generate_chunks(state)
-        if state['step']=='chunks_generated': step_create_plan(state)
-        if state['step']=='plan_created': step_create_cache(state, client)
-        if state['step']=='cache_created': step_execute_batches(state, client)
-        if state['step']=='batches_executed': step_cleanup(state, client)
-        if state['step']=='cleanup_done': step_report(state)
+        if state.get('step') != 'chunks_generated':
+            step_generate_chunks(state)
+
+        if state.get('step') == 'chunks_generated':
+            step_create_plan(state)
+
+        if state.get('step') == 'plan_created':
+            step_create_cache(state, client)
+
+        if state.get('step') == 'cache_created':
+            step_execute_batches(state, client)
+
+        if state.get('step') == 'batches_executed':
+            step_cleanup(state, client)
+
+        if state.get('step') == 'cleanup_done':
+            step_report(state)
+
     except Exception as e:
         print(f"[!] Pipeline error: {e}")
         save_state(state)
     else:
-        print(f"Done: {state['step']}")
-        if delete_state_on_exit: cleanup_files()
-
+        print(f"Done: {state.get('step')}")
+        if delete_state_on_exit:
+            cleanup_files()
