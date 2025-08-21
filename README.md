@@ -2,8 +2,6 @@
 
 <img width="969" alt="Screenshot 2025-07-10 at 4 22 27 AM" src="https://github.com/user-attachments/assets/c05f567e-27eb-44c3-b9f8-c645081ed5a9" />
 
-
-
 🚀 GSoC 2025 Project with **Google DeepMind**  
 **Efficient Batch Prediction with Long Context and Smart Caching using Gemini API**
 
