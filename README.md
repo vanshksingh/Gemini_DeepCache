@@ -26,10 +26,10 @@ This project demonstrates robust use of **Gemini 2.5 API** for scalable inferenc
 ## 🖥️ UI & Screenshots
 
 ### 1. Terminal View
-<img width="900" alt="Homepage UI" src="screenshots/homepage.png" />
+<img width="1273" height="1098" alt="Screenshot 2025-08-25 at 4 04 41 PM" src="https://github.com/user-attachments/assets/c85ac990-c0df-45e9-b4ea-bbfa79b2147b" />
 
 ### 2. Final Output
-<img width="900" alt="Cache Creation UI" src="screenshots/create_cache.png" />
+<img width="928" height="961" alt="Screenshot 2025-08-25 at 4 05 12 PM" src="https://github.com/user-attachments/assets/cf6160c3-213f-494a-8686-db2a764af717" />
 
 ### 3. More Demonstration
 Additional screencapture (Full Run) are available in the  
