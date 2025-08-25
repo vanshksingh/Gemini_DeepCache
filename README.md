@@ -23,6 +23,19 @@ In free tier of Gemini API Explicit cache is not functioning, it is being intern
 This project demonstrates robust use of **Gemini 2.5 API** for scalable inference while saving cost and improving performance.
 
 ---
+## 🖥️ UI & Screenshots
+
+### 1. Terminal View
+<img width="900" alt="Homepage UI" src="screenshots/homepage.png" />
+
+### 2. Final Output
+<img width="900" alt="Cache Creation UI" src="screenshots/create_cache.png" />
+
+### 3. More Demonstration
+Additional screencapture (Full Run) are available in the  
+[`/ScreenCapture`](./ScreenCapture) folder.
+
+---
 
 ## 🔧 Setup Instructions
 
